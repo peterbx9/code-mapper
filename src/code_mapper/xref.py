@@ -54,6 +54,7 @@ class SymbolRef:
 class XRefTable:
     symbols: dict[str, SymbolRef] = field(default_factory=dict)
     findings: list[dict] = field(default_factory=list)
+    _internal_refs: dict[str, set] = field(default_factory=dict)
 
     def to_dict(self):
         return {
@@ -99,6 +100,7 @@ def build_xref(project_root: Path, repo_map: RepoMap, exclude_dirs: set = None) 
             )
 
     _scan_module_level_symbols(project_root, repo_map, xref, exclude_dirs)
+    _scan_internal_references(project_root, repo_map, xref)
     _scan_references(project_root, repo_map, xref, exclude_dirs)
     _detect_cross_file_issues(xref)
 
@@ -137,6 +139,55 @@ def _scan_module_level_symbols(project_root: Path, repo_map: RepoMap,
                                 defined_in=node.path,
                                 defined_line=stmt.lineno,
                             )
+
+
+def _scan_internal_references(project_root: Path, repo_map: RepoMap, xref: XRefTable):
+    for node in repo_map.nodes:
+        if node.type != NodeType.FILE:
+            continue
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source, filename=str(file_path))
+        except SyntaxError:
+            continue
+
+        defined_names = set()
+        for key, sym in xref.symbols.items():
+            if sym.defined_in == node.path:
+                defined_names.add(sym.name)
+
+        used_names = set()
+        defined_at_lines = {}
+        for stmt in ast.iter_child_nodes(tree):
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        defined_at_lines[target.id] = stmt.lineno
+            elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                defined_at_lines[stmt.name] = stmt.lineno
+            elif isinstance(stmt, ast.ClassDef):
+                defined_at_lines[stmt.name] = stmt.lineno
+
+        for ast_node in ast.walk(tree):
+            if isinstance(ast_node, ast.Name) and ast_node.id in defined_names:
+                name = ast_node.id
+                def_line = defined_at_lines.get(name, 0)
+                if hasattr(ast_node, 'lineno') and ast_node.lineno != def_line:
+                    used_names.add(name)
+            elif isinstance(ast_node, ast.Attribute):
+                if isinstance(ast_node.value, ast.Name) and ast_node.value.id in defined_names:
+                    used_names.add(ast_node.value.id)
+
+        for stmt in ast.walk(tree):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for child in ast.walk(stmt):
+                    if isinstance(child, ast.Name) and child.id in defined_names:
+                        used_names.add(child.id)
+
+        xref._internal_refs[node.path] = used_names
 
 
 def _scan_references(project_root: Path, repo_map: RepoMap,
@@ -238,28 +289,15 @@ def _get_call_name(node: ast.Call) -> Optional[str]:
 
 
 def _detect_cross_file_issues(xref: XRefTable):
-    same_file_refs = defaultdict(set)
-    for key, sym in xref.symbols.items():
-        for other_key, other_sym in xref.symbols.items():
-            if other_key == key:
-                continue
-            if other_sym.defined_in == sym.defined_in:
-                continue
-            if sym.name in _get_sym_names_in_file(xref, other_sym.defined_in):
-                same_file_refs[key].add(other_sym.defined_in)
-
-    internally_used = set()
-    for key, sym in xref.symbols.items():
-        if _is_used_in_own_file(xref, sym):
-            internally_used.add(key)
-
     for key, sym in xref.symbols.items():
         if sym.name.startswith("_"):
             continue
         if sym.name in ("__init__", "__main__", "main"):
             continue
 
-        if not sym.is_used and key not in internally_used:
+        internally_used = sym.name in xref._internal_refs.get(sym.defined_in, set())
+
+        if not sym.is_used and not internally_used:
             if sym.type in ("function", "class"):
                 xref.findings.append({
                     "rule": "XREF_UNUSED_SYMBOL",
@@ -278,7 +316,7 @@ def _detect_cross_file_issues(xref: XRefTable):
                 })
 
         if sym.imported_by and not sym.called_from and not sym.referenced_in:
-            if sym.type == "function" and key not in internally_used:
+            if sym.type == "function" and not internally_used:
                 importers = [i["file"] for i in sym.imported_by]
                 xref.findings.append({
                     "rule": "XREF_IMPORTED_NOT_CALLED",
@@ -287,29 +325,3 @@ def _detect_cross_file_issues(xref: XRefTable):
                     "line": sym.defined_line,
                     "desc": f"Function '{sym.name}' imported by {importers} but never actually called",
                 })
-
-
-def _is_used_in_own_file(xref: XRefTable, sym: SymbolRef) -> bool:
-    for other_key, other_sym in xref.symbols.items():
-        if other_sym.defined_in != sym.defined_in:
-            continue
-        if other_sym.name == sym.name:
-            continue
-        for ref in other_sym.called_from:
-            if ref.get("call", "").endswith(sym.name) and ref["file"] == sym.defined_in:
-                return True
-    return _check_internal_refs(xref, sym)
-
-
-def _check_internal_refs(xref: XRefTable, sym: SymbolRef) -> bool:
-    for ref in sym.called_from:
-        if ref["file"] == sym.defined_in:
-            return True
-    for ref in sym.referenced_in:
-        if ref["file"] == sym.defined_in:
-            return True
-    return False
-
-
-def _get_sym_names_in_file(xref: XRefTable, file_path: str) -> set:
-    return {s.name for s in xref.symbols.values() if s.defined_in == file_path}

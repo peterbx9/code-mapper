@@ -35,6 +35,9 @@ def main():
     parser.add_argument("--no-connectivity", action="store_true", help="Skip connectivity analysis")
     parser.add_argument("--lint", action="store_true", help="Run Tier 1 AST lint rules")
     parser.add_argument("--xref", action="store_true", help="Build cross-reference symbol table (Tier 1.5)")
+    parser.add_argument("--ai", action="store_true", help="Tier 2: AI review per logic block via Ollama")
+    parser.add_argument("--model", default=None, help="Ollama model (default: qwen2.5-coder:7b, or :32b for deep)")
+    parser.add_argument("--ollama-url", default=None, help="Ollama API URL (default: http://127.0.0.1:11434)")
 
     args = parser.parse_args()
 
@@ -115,6 +118,38 @@ def main():
             for m in stats["most_referenced"]:
                 print(f"    {m['name']} ({m['usage_count']}x) — {m['defined_in']}")
         repo_map.stats["xref"] = xref_data
+
+    if args.ai:
+        from .ai_reviewer import review_project
+        ai_model = args.model or "qwen2.5-coder:7b"
+        xref_data_for_ai = repo_map.stats.get("xref") if args.xref else None
+        lint_for_ai = repo_map.stats.get("lint_findings") if args.lint else None
+
+        if not args.no_cluster and not repo_map.logic_blocks:
+            resolution = (config or {}).get("clustering", {}).get("resolution", 1.0)
+            blocks = cluster_logic_blocks(repo_map, resolution=resolution)
+            repo_map.logic_blocks = blocks
+
+        print(f"\n  AI REVIEW (model: {ai_model}):")
+        ai_findings = review_project(
+            project_root, repo_map,
+            model=ai_model,
+            ollama_url=args.ollama_url,
+            xref_data=xref_data_for_ai,
+            lint_findings=lint_for_ai,
+        )
+        if ai_findings:
+            print(f"  AI FINDINGS ({len(ai_findings)}):")
+            for f in ai_findings:
+                sev = f.get("severity", "?")
+                fp = f.get("file", "?")
+                ln = f.get("line", "?")
+                desc = f.get("desc", "?")
+                blk = f.get("block", "?")
+                print(f"    [{sev}] {fp}:{ln} ({blk}): {desc}")
+            repo_map.stats["ai_findings"] = ai_findings
+        else:
+            print("  AI: no findings")
 
     output_path = Path(args.output) if args.output else project_root / "repo-map.json"
     output_path.write_text(repo_map.to_json(), encoding="utf-8")
