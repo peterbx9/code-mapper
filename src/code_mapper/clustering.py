@@ -129,29 +129,53 @@ def _component_cluster(file_nodes, affinity) -> list[LogicBlock]:
 def _infer_block_name(node_ids: list[str]) -> str:
     paths = [nid.replace("file:", "") for nid in node_ids]
 
-    common_dirs = defaultdict(int)
+    subdir_counts = defaultdict(int)
     for p in paths:
         parts = p.split("/")
-        for part in parts[:-1]:
-            common_dirs[part] += 1
+        if len(parts) >= 2:
+            subdir_counts[parts[-2]] += 1
+
+    deepest_common = ""
+    if subdir_counts:
+        top_subdir = max(subdir_counts, key=subdir_counts.get)
+        if subdir_counts[top_subdir] >= len(paths) * 0.5:
+            deepest_common = top_subdir
 
     keywords = defaultdict(int)
+    skip_words = {"__init__", "backend", "routers", "services", "models", "schemas", "jobs", "py"}
     for p in paths:
         stem = p.split("/")[-1].replace(".py", "").replace("_", " ")
         for word in stem.split():
-            if len(word) > 2:
+            if len(word) > 2 and word.lower() not in skip_words:
                 keywords[word] += 1
 
-    if common_dirs:
-        top_dir = max(common_dirs, key=common_dirs.get)
-        if common_dirs[top_dir] >= len(paths) * 0.5:
-            return top_dir.replace("_", " ").title()
+    top_keywords = sorted(keywords.items(), key=lambda x: -x[1])[:3]
+    kw_label = " + ".join(kw.title() for kw, _ in top_keywords if _ >= 2)
 
-    if keywords:
-        top_kw = max(keywords, key=keywords.get)
-        return top_kw.title()
+    if deepest_common and deepest_common.lower() not in skip_words:
+        label = deepest_common.replace("_", " ").title()
+        if kw_label:
+            label = f"{label}: {kw_label}"
+        return label
 
-    return f"Group ({len(node_ids)} files)"
+    if deepest_common:
+        if kw_label:
+            return kw_label
+        dir_path_parts = set()
+        for p in paths:
+            parts = p.split("/")
+            if len(parts) >= 3:
+                dir_path_parts.add(parts[-2])
+        if len(dir_path_parts) == 1:
+            return list(dir_path_parts)[0].replace("_", " ").title()
+        if len(dir_path_parts) > 1:
+            return " + ".join(sorted(d.replace("_", " ").title() for d in dir_path_parts))
+
+    if kw_label:
+        return kw_label
+
+    stems = [p.split("/")[-1].replace(".py", "") for p in paths[:3]]
+    return ", ".join(stems)
 
 
 def _find_shared(node_ids: list[str], repo_map: RepoMap, attr: str) -> list[str]:

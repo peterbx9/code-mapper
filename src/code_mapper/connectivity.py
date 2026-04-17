@@ -59,20 +59,42 @@ def analyze_connectivity(repo_map: RepoMap):
 
     file_nodes = [n for n in repo_map.nodes if n.type == NodeType.FILE]
 
+    structural_files = set()
+    schema_files = set()
+    standalone_scripts = set()
+    for node in file_nodes:
+        basename = node.path.split("/")[-1]
+        if basename == "__init__.py":
+            structural_files.add(node.id)
+        if "/schemas/" in node.path or "schemas/" in node.path:
+            schema_files.add(node.id)
+        if "/" not in node.path or node.path.startswith("tols-pbj/") or node.path.startswith("updates/"):
+            standalone_scripts.add(node.id)
+
     unreachable = []
     incomplete = []
 
     for node in file_nodes:
+        if node.id in structural_files:
+            node.connectivity = ConnectivityStatus.REACHABLE
+            continue
+
         has_inbound = bool(backward.get(node.id))
         in_reachable = node.id in reachable_from_entries
         in_effect = node.id in reaches_effect
 
         if not in_reachable and not has_inbound and node.id not in entry_ids:
-            node.connectivity = ConnectivityStatus.UNREACHABLE
-            unreachable.append(node.id)
+            if node.id in standalone_scripts:
+                node.connectivity = ConnectivityStatus.REACHABLE
+            else:
+                node.connectivity = ConnectivityStatus.UNREACHABLE
+                unreachable.append(node.id)
         elif in_reachable and not in_effect and node.id not in effect_nodes:
-            node.connectivity = ConnectivityStatus.INCOMPLETE
-            incomplete.append(node.id)
+            if node.id in schema_files:
+                node.connectivity = ConnectivityStatus.REACHABLE
+            else:
+                node.connectivity = ConnectivityStatus.INCOMPLETE
+                incomplete.append(node.id)
         else:
             node.connectivity = ConnectivityStatus.REACHABLE
 
