@@ -41,8 +41,9 @@ def analyze_connectivity(repo_map: RepoMap):
                 entry_ids.add(node.id)
 
     if not entry_ids:
+        _ENTRY_NAMES = {"main", "__main__", "cli", "app", "server", "wsgi", "asgi"}
         for node in repo_map.nodes:
-            if node.type == NodeType.FILE and node.name == "main":
+            if node.type == NodeType.FILE and node.name in _ENTRY_NAMES:
                 entry_ids.add(node.id)
 
     reachable_from_entries = _bfs_forward(entry_ids, forward)
@@ -55,7 +56,13 @@ def analyze_connectivity(repo_map: RepoMap):
             if node.tables:
                 effect_nodes.add(node.id)
 
-    reaches_effect = _bfs_backward(effect_nodes, backward)
+    has_route_or_table_effects = bool(effect_nodes)
+    effect_nodes.update(entry_ids)
+
+    if has_route_or_table_effects:
+        reaches_effect = _bfs_backward(effect_nodes, backward)
+    else:
+        reaches_effect = reachable_from_entries
 
     file_nodes = [n for n in repo_map.nodes if n.type == NodeType.FILE]
 

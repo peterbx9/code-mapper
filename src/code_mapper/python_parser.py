@@ -175,10 +175,17 @@ def _extract_imports(tree: ast.Module, file_rel_path: str, edges: list[Edge]):
 
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
+            level = node.level or 0
+
+            if level > 0:
+                resolved = _resolve_relative_import(file_rel_path, module, level)
+            else:
+                resolved = module
+
             if node.names and node.names[0].name == "*":
                 edges.append(Edge(
                     source=file_id,
-                    target=f"module:{module}",
+                    target=f"module:{resolved}",
                     type=EdgeType.IMPORT,
                     flags=flags + [EdgeFlag.DYNAMIC],
                     metadata={"star_import": True, "line": node.lineno},
@@ -187,11 +194,24 @@ def _extract_imports(tree: ast.Module, file_rel_path: str, edges: list[Edge]):
                 for alias in node.names:
                     edges.append(Edge(
                         source=file_id,
-                        target=f"module:{module}.{alias.name}" if module else f"module:{alias.name}",
+                        target=f"module:{resolved}.{alias.name}" if resolved else f"module:{alias.name}",
                         type=EdgeType.IMPORT,
                         flags=flags,
                         metadata={"alias": alias.asname, "line": node.lineno},
                     ))
+
+
+def _resolve_relative_import(file_rel_path: str, module: str, level: int) -> str:
+    parts = file_rel_path.replace("\\", "/").replace(".py", "").split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    for _ in range(level - 1):
+        if parts:
+            parts.pop()
+    package = ".".join(parts[:-1]) if len(parts) > 1 else ""
+    if module:
+        return f"{package}.{module}" if package else module
+    return package
 
 
 def _build_scope_tags(tree: ast.Module) -> dict:

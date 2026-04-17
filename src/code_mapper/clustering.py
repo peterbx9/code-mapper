@@ -47,13 +47,24 @@ def cluster_logic_blocks(repo_map: RepoMap, resolution: float = 1.0,
             pair = tuple(sorted([file_id, neighbor]))
             affinity[pair] += 1.0
 
-    try:
-        import networkx as nx
-        from networkx.algorithms.community import louvain_communities
-        blocks = _louvain_cluster(file_nodes, affinity, resolution)
-    except ImportError:
-        logger.info("networkx not available, falling back to component clustering")
-        blocks = _component_cluster(file_nodes, affinity)
+    if not affinity:
+        logger.info("No affinity edges — all files in one block or singletons")
+        blocks = [LogicBlock(
+            id="block:0",
+            name=_infer_block_name([n.id for n in file_nodes]),
+            node_ids=[n.id for n in file_nodes],
+        )]
+    else:
+        try:
+            import networkx as nx
+            from networkx.algorithms.community import louvain_communities
+            blocks = _louvain_cluster(file_nodes, affinity, resolution)
+        except (ImportError, Exception) as e:
+            if isinstance(e, ImportError):
+                logger.info("networkx not available, falling back to component clustering")
+            else:
+                logger.warning(f"Louvain failed ({e}), falling back to component clustering")
+            blocks = _component_cluster(file_nodes, affinity)
 
     for block in blocks:
         block.shared_tables = _find_shared(block.node_ids, repo_map, "tables")
