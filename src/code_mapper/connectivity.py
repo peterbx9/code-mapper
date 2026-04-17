@@ -69,8 +69,11 @@ def analyze_connectivity(repo_map: RepoMap):
     structural_files = set()
     schema_files = set()
     config_files = set()
+    middleware_files = set()
     standalone_scripts = set()
     _CONFIG_NAMES = {"config", "settings", "constants", "defaults", "env"}
+    _MIDDLEWARE_NAMES = {"csrf", "middleware", "cors", "logging_middleware", "auth_middleware"}
+    _STANDALONE_DIRS = {"tols-pbj", "updates", "migrations", "versions", "scripts", "tools"}
     for node in file_nodes:
         basename = node.path.split("/")[-1]
         stem = basename.replace(".py", "")
@@ -80,7 +83,12 @@ def analyze_connectivity(repo_map: RepoMap):
             schema_files.add(node.id)
         if stem in _CONFIG_NAMES and not node.routes and not node.tables:
             config_files.add(node.id)
-        if "/" not in node.path or node.path.startswith("tols-pbj/") or node.path.startswith("updates/"):
+        if stem in _MIDDLEWARE_NAMES:
+            middleware_files.add(node.id)
+        parts = set(node.path.replace("\\", "/").split("/")[:-1])
+        if "/" not in node.path or parts & _STANDALONE_DIRS:
+            standalone_scripts.add(node.id)
+        if stem == "cli" or stem.endswith("_cli") or stem == "manage":
             standalone_scripts.add(node.id)
 
     unreachable = []
@@ -102,7 +110,7 @@ def analyze_connectivity(repo_map: RepoMap):
                 node.connectivity = ConnectivityStatus.UNREACHABLE
                 unreachable.append(node.id)
         elif in_reachable and not in_effect and node.id not in effect_nodes:
-            if node.id in schema_files or node.id in config_files:
+            if node.id in schema_files or node.id in config_files or node.id in middleware_files:
                 node.connectivity = ConnectivityStatus.REACHABLE
             else:
                 node.connectivity = ConnectivityStatus.INCOMPLETE
