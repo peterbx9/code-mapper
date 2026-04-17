@@ -104,6 +104,7 @@ def build_xref(project_root: Path, repo_map: RepoMap, exclude_dirs: set = None) 
     _scan_references(project_root, repo_map, xref, exclude_dirs)
     xref._repo_map = repo_map
     _detect_cross_file_issues(xref)
+    _detect_duplicate_functions(project_root, repo_map, xref)
 
     return xref
 
@@ -299,8 +300,18 @@ def _find_depends_targets(xref: XRefTable) -> set:
     targets = set()
     DEPENDS_INJECTED = {"get_db", "get_current_user", "require_admin", "require_permission",
                         "get_session", "get_token"}
+    FRAMEWORK_OVERRIDES = {
+        "handle_starttag", "handle_endtag", "handle_data", "handle_startendtag",
+        "handle_comment", "handle_decl", "handle_pi", "handle_charref",
+        "handle_entityref", "feed", "close", "reset",
+        "setUp", "tearDown", "setUpClass", "tearDownClass",
+        "test_", "__enter__", "__exit__", "__repr__", "__str__",
+        "__init__", "__del__", "__hash__", "__eq__", "__lt__", "__gt__",
+    }
     for key, sym in xref.symbols.items():
         if sym.name in DEPENDS_INJECTED:
+            targets.add(sym.name)
+        if sym.name in FRAMEWORK_OVERRIDES:
             targets.add(sym.name)
     return targets
 
@@ -315,6 +326,69 @@ def _find_node_in_repo(xref: XRefTable, sym: SymbolRef):
             if short == sym.name and node.line_start == sym.defined_line:
                 return node
     return None
+
+
+def _detect_duplicate_functions(project_root: Path, repo_map: RepoMap, xref: XRefTable):
+    """Find functions with near-identical bodies across different files."""
+    import hashlib
+
+    func_hashes = defaultdict(list)
+
+    for node in repo_map.nodes:
+        if node.type != NodeType.FUNCTION:
+            continue
+        if node.name.startswith("_") and node.name != "__init__":
+            continue
+
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        lines = source.splitlines()
+        func_lines = lines[node.line_start - 1:node.line_end]
+        if len(func_lines) < 3:
+            continue
+
+        body_lines = func_lines[1:]
+        normalized = "\n".join(line.strip() for line in body_lines if line.strip())
+        if len(normalized) < 30:
+            continue
+
+        body_hash = hashlib.md5(normalized.encode()).hexdigest()
+        short_name = node.name.split(".")[-1] if "." in node.name else node.name
+        func_hashes[body_hash].append({
+            "name": short_name,
+            "file": node.path,
+            "line": node.line_start,
+            "body_len": len(func_lines),
+        })
+
+    for body_hash, funcs in func_hashes.items():
+        if len(funcs) < 2:
+            continue
+
+        files_involved = {f["file"] for f in funcs}
+        if len(files_involved) < 2:
+            continue
+
+        locations = [f"{f['file']}:{f['line']}" for f in funcs]
+        names = list({f["name"] for f in funcs})
+
+        for func in funcs:
+            this_loc = f"{func['file']}:{func['line']}"
+            other_locs = ", ".join(loc for loc in locations if loc != this_loc)
+            xref.findings.append({
+                "rule": "XREF_DUPLICATE_FUNCTION",
+                "severity": "med",
+                "file": func["file"],
+                "line": func["line"],
+                "desc": f"Function '{func['name']}' body is identical to {other_locs} — extract to shared module",
+            })
 
 
 def _get_call_name(node: ast.Call) -> Optional[str]:

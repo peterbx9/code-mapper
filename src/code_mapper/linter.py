@@ -72,6 +72,10 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         findings.extend(_check_list_pop_zero(tree, rel))
         findings.extend(_check_unguarded_json(tree, rel))
         findings.extend(_check_unused_argparse_args(tree, rel))
+        findings.extend(_check_self_assign_in_except(tree, rel))
+        findings.extend(_check_swallowed_exceptions(tree, rel))
+        findings.extend(_check_unguarded_file_open(tree, rel))
+        findings.extend(_check_magic_numbers(tree, rel))
 
     return findings
 
@@ -301,6 +305,149 @@ def _check_unused_argparse_args(tree: ast.Module, file_path: str) -> list[LintFi
                 severity="med",
                 desc=f"argparse flag '--{dest_name.replace('_', '-')}' defined but 'args.{dest_name}' never read",
             ))
+
+    return findings
+
+
+def _check_self_assign_in_except(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect X = X inside except blocks — usually a NameError waiting to happen."""
+    findings = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        for stmt in ast.walk(node):
+            if not isinstance(stmt, ast.Assign):
+                continue
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Name):
+                    if target.id == stmt.value.id:
+                        findings.append(LintFinding(
+                            file_path=file_path,
+                            line=stmt.lineno,
+                            rule="SELF_ASSIGN_IN_EXCEPT",
+                            severity="high",
+                            desc=f"'{target.id} = {stmt.value.id}' in except block — if the try failed before assigning '{target.id}', this raises NameError",
+                        ))
+
+    return findings
+
+
+def _check_swallowed_exceptions(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect except blocks that catch broadly and don't log/raise/re-raise."""
+    findings = []
+
+    LOGGING_CALLS = {"log", "logger", "logging", "print", "traceback", "warn", "warning", "error", "critical"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+
+        is_broad = (node.type is None or
+                    (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException")))
+        if not is_broad:
+            continue
+
+        has_raise = False
+        has_log = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Raise):
+                has_raise = True
+            if isinstance(child, ast.Call):
+                func = child.func
+                name = ""
+                if isinstance(func, ast.Name):
+                    name = func.id
+                elif isinstance(func, ast.Attribute):
+                    name = func.attr
+                    if isinstance(func.value, ast.Name):
+                        name = f"{func.value.id}.{func.attr}"
+                if any(log_name in name.lower() for log_name in LOGGING_CALLS):
+                    has_log = True
+
+        if not has_raise and not has_log:
+            body_stmts = [s for s in node.body if not isinstance(s, ast.Pass)]
+            if len(body_stmts) <= 1:
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="SWALLOWED_EXCEPTION",
+                    severity="med",
+                    desc="Broad except catches Exception but doesn't log, raise, or re-raise — failures are invisible",
+                ))
+
+    return findings
+
+
+def _check_unguarded_file_open(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect open() calls not inside try/except."""
+    findings = []
+    scope_tags = _build_try_scope(tree)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_open = False
+        if isinstance(func, ast.Name) and func.id == "open":
+            is_open = True
+        elif isinstance(func, ast.Attribute) and func.attr == "open":
+            is_open = True
+
+        if is_open and not scope_tags.get(id(node), False):
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=node.lineno,
+                rule="UNGUARDED_FILE_OPEN",
+                severity="low",
+                desc="open() called without try/except — FileNotFoundError or PermissionError will crash",
+            ))
+
+    return findings
+
+
+def _check_magic_numbers(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect numeric literals that match a module-level constant's value but use the literal instead."""
+    findings = []
+
+    constants = {}
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id.isupper():
+                    if isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, float)):
+                        if node.value.value not in (0, 1, 2, -1, 100, True, False):
+                            constants[node.value.value] = target.id
+
+    if not constants:
+        return findings
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant):
+            continue
+        if not isinstance(node.value, (int, float)):
+            continue
+        if node.value not in constants:
+            continue
+
+        is_module_level_assign = False
+        for top_node in ast.iter_child_nodes(tree):
+            if isinstance(top_node, ast.Assign):
+                for child in ast.walk(top_node):
+                    if child is node:
+                        is_module_level_assign = True
+                        break
+        if is_module_level_assign:
+            continue
+
+        const_name = constants[node.value]
+        findings.append(LintFinding(
+            file_path=file_path,
+            line=node.lineno,
+            rule="MAGIC_NUMBER_VS_CONSTANT",
+            severity="low",
+            desc=f"Literal {node.value} used instead of constant '{const_name}' (defined in this file with the same value)",
+        ))
 
     return findings
 
