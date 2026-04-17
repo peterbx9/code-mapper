@@ -17,6 +17,8 @@ from pathlib import Path
 from .assembler import assemble_map, load_config
 from .clustering import cluster_logic_blocks
 from .connectivity import analyze_connectivity
+from .linter import lint_project
+from .xref import build_xref
 
 
 def main():
@@ -31,6 +33,8 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     parser.add_argument("--no-cluster", action="store_true", help="Skip logic block clustering")
     parser.add_argument("--no-connectivity", action="store_true", help="Skip connectivity analysis")
+    parser.add_argument("--lint", action="store_true", help="Run Tier 1 AST lint rules")
+    parser.add_argument("--xref", action="store_true", help="Build cross-reference symbol table (Tier 1.5)")
 
     args = parser.parse_args()
 
@@ -82,6 +86,35 @@ def main():
             print(f"  INCOMPLETE WIRING ({len(incomplete)}):")
             for inc in incomplete:
                 print(f"    {inc}")
+
+    if args.lint:
+        from .assembler import DEFAULT_EXCLUDE
+        exclude = set(config.get("exclude", [])) | DEFAULT_EXCLUDE if config else DEFAULT_EXCLUDE
+        lint_findings = lint_project(project_root, repo_map, exclude_dirs=exclude)
+        if lint_findings:
+            print(f"  LINT FINDINGS ({len(lint_findings)}):")
+            for f in lint_findings:
+                print(f"    [{f.severity}] {f.file_path}:{f.line} {f.rule}: {f.desc}")
+            repo_map.stats["lint_findings"] = [f.to_dict() for f in lint_findings]
+        else:
+            print("  Lint: clean")
+
+    if args.xref:
+        from .assembler import DEFAULT_EXCLUDE
+        exclude = set(config.get("exclude", [])) | DEFAULT_EXCLUDE if config else DEFAULT_EXCLUDE
+        xref = build_xref(project_root, repo_map, exclude_dirs=exclude)
+        xref_data = xref.to_dict()
+        stats = xref_data["stats"]
+        print(f"  XREF: {stats['total_symbols']} symbols, {stats['unused']} unused")
+        if xref.findings:
+            print(f"  XREF FINDINGS ({len(xref.findings)}):")
+            for f in xref.findings:
+                print(f"    [{f['severity']}] {f['file']}:{f['line']} {f['rule']}: {f['desc']}")
+        if stats["most_referenced"]:
+            print(f"  Most referenced:")
+            for m in stats["most_referenced"]:
+                print(f"    {m['name']} ({m['usage_count']}x) — {m['defined_in']}")
+        repo_map.stats["xref"] = xref_data
 
     output_path = Path(args.output) if args.output else project_root / "repo-map.json"
     output_path.write_text(repo_map.to_json(), encoding="utf-8")
