@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--xref", action="store_true", help="Build cross-reference symbol table (Tier 1.5)")
     parser.add_argument("--ai", action="store_true", help="Tier 2: AI review per file via Ollama")
     parser.add_argument("--deep", action="store_true", help="Tier 2 deep: 7B triage + 32B deep-dive on flagged files")
+    parser.add_argument("--verify", action="store_true", help="Tier 2 v3: targeted yes/no questions from structural signals")
     parser.add_argument("--model", default=None, help="Ollama triage model (default: qwen2.5-coder:7b)")
     parser.add_argument("--deep-model", default=None, help="Ollama deep model (default: qwen2.5-coder:32b)")
     parser.add_argument("--ollama-url", default=None, help="Ollama API URL (default: http://127.0.0.1:11434)")
@@ -161,6 +162,29 @@ def main():
             repo_map.stats["ai_findings"] = ai_findings
         else:
             print("  AI: no findings")
+
+    if args.verify:
+        from .questioner import generate_and_verify
+        verify_model = args.model or "qwen2.5-coder:7b"
+        xref_data_for_verify = repo_map.stats.get("xref") if args.xref else None
+        ollama = args.ollama_url or "http://127.0.0.1:11434"
+
+        print(f"\n  TARGETED VERIFICATION (model: {verify_model}):")
+        verify_findings = generate_and_verify(
+            project_root, repo_map,
+            xref_data=xref_data_for_verify,
+            model=verify_model,
+            ollama_url=ollama,
+        )
+        if verify_findings:
+            print(f"  VERIFIED BUGS ({len(verify_findings)}):")
+            for f in verify_findings:
+                print(f"    [HIGH] {f['file']}:{f['line']} — {f['bug_desc']}")
+                print(f"           Evidence: {f.get('evidence', '?')}")
+                print(f"           Signal: {f['signal']}")
+            repo_map.stats["verified_findings"] = verify_findings
+        else:
+            print("  Verification: all checks passed")
 
     output_path = Path(args.output) if args.output else project_root / "repo-map.json"
     output_path.write_text(repo_map.to_json(), encoding="utf-8")
