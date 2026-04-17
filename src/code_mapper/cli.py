@@ -35,8 +35,10 @@ def main():
     parser.add_argument("--no-connectivity", action="store_true", help="Skip connectivity analysis")
     parser.add_argument("--lint", action="store_true", help="Run Tier 1 AST lint rules")
     parser.add_argument("--xref", action="store_true", help="Build cross-reference symbol table (Tier 1.5)")
-    parser.add_argument("--ai", action="store_true", help="Tier 2: AI review per logic block via Ollama")
-    parser.add_argument("--model", default=None, help="Ollama model (default: qwen2.5-coder:7b, or :32b for deep)")
+    parser.add_argument("--ai", action="store_true", help="Tier 2: AI review per file via Ollama")
+    parser.add_argument("--deep", action="store_true", help="Tier 2 deep: 7B triage + 32B deep-dive on flagged files")
+    parser.add_argument("--model", default=None, help="Ollama triage model (default: qwen2.5-coder:7b)")
+    parser.add_argument("--deep-model", default=None, help="Ollama deep model (default: qwen2.5-coder:32b)")
     parser.add_argument("--ollama-url", default=None, help="Ollama API URL (default: http://127.0.0.1:11434)")
 
     args = parser.parse_args()
@@ -125,28 +127,37 @@ def main():
         xref_data_for_ai = repo_map.stats.get("xref") if args.xref else None
         lint_for_ai = repo_map.stats.get("lint_findings") if args.lint else None
 
-        if not args.no_cluster and not repo_map.logic_blocks:
-            resolution = (config or {}).get("clustering", {}).get("resolution", 1.0)
-            blocks = cluster_logic_blocks(repo_map, resolution=resolution)
-            repo_map.logic_blocks = blocks
-
-        print(f"\n  AI REVIEW (model: {ai_model}):")
+        mode = "triage + deep-dive" if args.deep else "triage only"
+        print(f"\n  AI REVIEW ({mode}, model: {ai_model}):")
         ai_findings = review_project(
             project_root, repo_map,
             model=ai_model,
             ollama_url=args.ollama_url,
             xref_data=xref_data_for_ai,
             lint_findings=lint_for_ai,
+            deep=args.deep,
+            deep_model=args.deep_model,
         )
         if ai_findings:
-            print(f"  AI FINDINGS ({len(ai_findings)}):")
-            for f in ai_findings:
+            triage = [f for f in ai_findings if f.get("source") == "ai_triage"]
+            deep = [f for f in ai_findings if f.get("source") == "ai_deep"]
+            print(f"  TRIAGE FINDINGS ({len(triage)}):")
+            for f in triage:
                 sev = f.get("severity", "?")
                 fp = f.get("file", "?")
                 ln = f.get("line", "?")
+                cat = f.get("category", "?")
                 desc = f.get("desc", "?")
-                blk = f.get("block", "?")
-                print(f"    [{sev}] {fp}:{ln} ({blk}): {desc}")
+                print(f"    [{sev}] {fp}:{ln} [{cat}]: {desc}")
+            if deep:
+                print(f"  DEEP FINDINGS ({len(deep)}):")
+                for f in deep:
+                    sev = f.get("severity", "?")
+                    fp = f.get("file", "?")
+                    ln = f.get("line", "?")
+                    cat = f.get("category", "?")
+                    desc = f.get("desc", "?")
+                    print(f"    [{sev}] {fp}:{ln} [{cat}]: {desc}")
             repo_map.stats["ai_findings"] = ai_findings
         else:
             print("  AI: no findings")
