@@ -109,6 +109,14 @@ def _generate_questions(project_root: Path, repo_map: RepoMap,
                         xref_data: dict = None) -> list[TargetedQuestion]:
     questions = []
 
+    has_connectivity = any(
+        n.connectivity != ConnectivityStatus.REACHABLE
+        for n in repo_map.nodes if n.type == NodeType.FILE
+    )
+    if not has_connectivity:
+        from .connectivity import analyze_connectivity
+        analyze_connectivity(repo_map)
+
     questions.extend(_questions_from_connectivity(project_root, repo_map))
     questions.extend(_questions_from_xref(project_root, repo_map, xref_data))
     questions.extend(_questions_from_soft_delete(project_root, repo_map))
@@ -120,12 +128,11 @@ def _generate_questions(project_root: Path, repo_map: RepoMap,
 def _questions_from_connectivity(project_root: Path, repo_map: RepoMap) -> list[TargetedQuestion]:
     questions = []
 
-    for node in repo_map.nodes:
-        if node.type != NodeType.FILE:
-            continue
-        if node.connectivity != ConnectivityStatus.INCOMPLETE:
-            continue
+    incomplete_files = [n for n in repo_map.nodes
+                        if n.type == NodeType.FILE
+                        and n.connectivity == ConnectivityStatus.INCOMPLETE]
 
+    for node in incomplete_files:
         file_path = project_root / node.path
         if not file_path.exists():
             continue
@@ -138,24 +145,22 @@ def _questions_from_connectivity(project_root: Path, repo_map: RepoMap) -> list[
                 continue
             if func_node.path != node.path:
                 continue
+            if func_node.name.startswith("_") and func_node.name != "__init__":
+                continue
 
             func_source = "\n".join(lines[func_node.line_start - 1:func_node.line_end])
+            if len(func_source) < 20:
+                continue
 
-            for edge in repo_map.edges:
-                if edge.source != node.id:
-                    continue
-                if edge.type.value == "import":
-                    target_name = edge.target.split(":")[-1].split(".")[-1]
-                    if target_name in func_source and "roles" in target_name.lower():
-                        questions.append(TargetedQuestion(
-                            file_path=node.path,
-                            question=f"In function '{func_node.name}', after the '{target_name}' data is loaded, is it actually used in any decision logic (if statement, return value, function argument)?",
-                            code_snippet=func_source,
-                            start_line=func_node.line_start,
-                            end_line=func_node.line_end,
-                            source_signal=f"INCOMPLETE wiring on {node.path}",
-                            bug_if_no=f"'{target_name}' loaded but never used in any decision — feature wired but idle",
-                        ))
+            questions.append(TargetedQuestion(
+                file_path=node.path,
+                question=f"In function '{func_node.name}', does it produce any observable effect — writing to a database, returning data to a caller, modifying a file, or sending a network request? Or does it load/compute data that is never actually used?",
+                code_snippet=func_source,
+                start_line=func_node.line_start,
+                end_line=func_node.line_end,
+                source_signal=f"INCOMPLETE wiring — {node.path} is reachable but has no path to an effect",
+                bug_if_no=f"Function '{func_node.name}' in {node.path} loads/computes data but never produces an effect — dead logic chain",
+            ))
 
     return questions
 
@@ -210,20 +215,46 @@ def _questions_from_xref(project_root: Path, repo_map: RepoMap,
 def _questions_from_soft_delete(project_root: Path, repo_map: RepoMap) -> list[TargetedQuestion]:
     questions = []
 
-    files_with_rules_table = []
+    soft_delete_tables = set()
     for node in repo_map.nodes:
-        if node.type == NodeType.FILE:
-            for table in node.tables:
-                if "rules" in table.lower() or "ada_rules" in table.lower():
-                    files_with_rules_table.append(node)
-                    break
+        if node.type != NodeType.FILE:
+            continue
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+            if "deleted_at" in source and "__tablename__" in source:
+                for table in node.tables:
+                    if not table.startswith("rel:") and "via" not in table:
+                        soft_delete_tables.add(table)
+        except Exception:
+            continue
 
-    for node in files_with_rules_table:
+    if not soft_delete_tables:
+        return questions
+
+    logger.debug(f"Soft-delete tables found: {soft_delete_tables}")
+
+    for node in repo_map.nodes:
+        if node.type != NodeType.FILE:
+            continue
         file_path = project_root / node.path
         if not file_path.exists():
             continue
 
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        has_query_keyword = any(kw in source.lower() for kw in ["query", "filter", "select", "execute", ".all()", ".first()"])
+        references_soft_table = any(t in source.lower() for t in soft_delete_tables)
+
+        if not (has_query_keyword and references_soft_table):
+            continue
+        if "deleted_at" in source:
+            continue
 
         try:
             tree = ast.parse(source)
@@ -234,20 +265,24 @@ def _questions_from_soft_delete(project_root: Path, repo_map: RepoMap) -> list[T
             if not isinstance(ast_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
 
-            func_source_lines = source.splitlines()[ast_node.lineno - 1:(ast_node.end_lineno or ast_node.lineno)]
-            func_source = "\n".join(func_source_lines)
+            func_lines = source.splitlines()[ast_node.lineno - 1:(ast_node.end_lineno or ast_node.lineno)]
+            func_source = "\n".join(func_lines)
 
-            if "ada_rules" in func_source.lower() or "rule" in ast_node.name.lower():
-                if "query" in func_source.lower() or "filter" in func_source.lower() or "select" in func_source.lower():
-                    questions.append(TargetedQuestion(
-                        file_path=node.path,
-                        question=f"In function '{ast_node.name}', when querying rules from the database, does the query include a filter for 'deleted_at IS NULL' or 'deleted_at == None' to exclude soft-deleted records?",
-                        code_snippet=func_source,
-                        start_line=ast_node.lineno,
-                        end_line=ast_node.end_lineno or ast_node.lineno,
-                        source_signal="soft-delete table 'ada_rules' queried without deleted_at check",
-                        bug_if_no="Query returns soft-deleted rules — deleted rules still applied during ADA checks",
-                    ))
+            if not any(t in func_source.lower() for t in soft_delete_tables):
+                continue
+            if not any(kw in func_source.lower() for kw in ["query", "filter", "select", "execute", ".all()", ".first()"]):
+                continue
+
+            matched_tables = [t for t in soft_delete_tables if t in func_source.lower()]
+            questions.append(TargetedQuestion(
+                file_path=node.path,
+                question=f"In function '{ast_node.name}', when querying from tables that support soft-delete ({', '.join(matched_tables)}), does the query include a filter for 'deleted_at IS NULL' or 'deleted_at == None' to exclude soft-deleted records?",
+                code_snippet=func_source,
+                start_line=ast_node.lineno,
+                end_line=ast_node.end_lineno or ast_node.lineno,
+                source_signal=f"File queries soft-delete table(s) {matched_tables} but does not reference deleted_at",
+                bug_if_no=f"Query returns soft-deleted records from {matched_tables} — deleted data still active",
+            ))
 
     return questions
 
