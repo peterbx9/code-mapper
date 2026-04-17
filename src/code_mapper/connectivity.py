@@ -6,7 +6,7 @@ Incomplete: has inbound edges but no path to an effect (route response, file wri
 """
 
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from .schema import RepoMap, Node, NodeType, EdgeType, ConnectivityStatus
 
@@ -128,18 +128,25 @@ def analyze_connectivity(repo_map: RepoMap):
         for nid in incomplete:
             logger.debug(f"  INCOMPLETE: {nid}")
 
+    cycles = _detect_circular_dependencies(repo_map)
+    if cycles:
+        logger.info(f"Circular dependencies: {len(cycles)} cycles")
+        for cycle in cycles:
+            logger.debug(f"  CYCLE: {' → '.join(cycle)}")
+
     return {
         "reachable": len(file_nodes) - len(unreachable) - len(incomplete),
         "unreachable": unreachable,
         "incomplete": incomplete,
+        "circular_dependencies": cycles,
     }
 
 
 def _bfs_forward(start_ids: set, graph: dict) -> set:
     visited = set()
-    queue = list(start_ids)
+    queue = deque(start_ids)
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         if current in visited:
             continue
         visited.add(current)
@@ -151,9 +158,9 @@ def _bfs_forward(start_ids: set, graph: dict) -> set:
 
 def _bfs_backward(start_ids: set, reverse_graph: dict) -> set:
     visited = set()
-    queue = list(start_ids)
+    queue = deque(start_ids)
     while queue:
-        current = queue.pop(0)
+        current = queue.popleft()
         if current in visited:
             continue
         visited.add(current)
@@ -161,3 +168,64 @@ def _bfs_backward(start_ids: set, reverse_graph: dict) -> set:
             if neighbor not in visited:
                 queue.append(neighbor)
     return visited
+
+
+def _detect_circular_dependencies(repo_map: RepoMap) -> list[list[str]]:
+    """Find all cycles in the file-level import graph using DFS."""
+    file_graph = defaultdict(set)
+    file_ids = set()
+
+    for node in repo_map.nodes:
+        if node.type == NodeType.FILE:
+            file_ids.add(node.id)
+
+    for edge in repo_map.edges:
+        if edge.type.value == "import" and edge.source in file_ids and edge.target in file_ids:
+            file_graph[edge.source].add(edge.target)
+
+    cycles = []
+    visited = set()
+    path_set = set()
+    path_list = []
+
+    def _dfs(node):
+        if node in path_set:
+            cycle_start = path_list.index(node)
+            cycle = [n.replace("file:", "") for n in path_list[cycle_start:]] + [node.replace("file:", "")]
+            if len(cycle) > 2:
+                normalized = _normalize_cycle(cycle)
+                if normalized not in seen_cycles:
+                    seen_cycles.add(normalized)
+                    cycles.append(cycle[:-1])
+            return
+        if node in visited:
+            return
+
+        visited.add(node)
+        path_set.add(node)
+        path_list.append(node)
+
+        for neighbor in file_graph.get(node, []):
+            _dfs(neighbor)
+
+        path_set.remove(node)
+        path_list.pop()
+
+    seen_cycles = set()
+    for node in sorted(file_ids):
+        visited.clear()
+        path_set.clear()
+        path_list.clear()
+        _dfs(node)
+
+    return cycles
+
+
+def _normalize_cycle(cycle: list[str]) -> tuple:
+    """Normalize a cycle so the same cycle found from different start nodes is deduplicated."""
+    without_repeat = cycle[:-1]
+    if not without_repeat:
+        return tuple(cycle)
+    min_idx = without_repeat.index(min(without_repeat))
+    rotated = without_repeat[min_idx:] + without_repeat[:min_idx]
+    return tuple(rotated)

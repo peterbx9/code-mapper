@@ -94,6 +94,11 @@ def main():
             print(f"  INCOMPLETE WIRING ({len(incomplete)}):")
             for inc in incomplete:
                 print(f"    {inc}")
+        cycles = conn.get("circular_dependencies", [])
+        if cycles:
+            print(f"  CIRCULAR DEPENDENCIES ({len(cycles)}):")
+            for cycle in cycles:
+                print(f"    {' → '.join(cycle)}")
 
     if args.lint:
         from .assembler import DEFAULT_EXCLUDE

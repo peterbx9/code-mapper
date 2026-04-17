@@ -76,6 +76,8 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         findings.extend(_check_swallowed_exceptions(tree, rel))
         findings.extend(_check_unguarded_file_open(tree, rel))
         findings.extend(_check_magic_numbers(tree, rel))
+        findings.extend(_check_god_objects(tree, rel, len(source.splitlines())))
+        findings.extend(_check_unreachable_code(tree, rel))
 
     return findings
 
@@ -307,6 +309,112 @@ def _check_unused_argparse_args(tree: ast.Module, file_path: str) -> list[LintFi
             ))
 
     return findings
+
+
+GOD_FILE_LOC = 500
+GOD_FUNC_LOC = 100
+GOD_FUNC_COMPLEXITY = 20
+GOD_CLASS_METHODS = 20
+
+
+def _check_god_objects(tree: ast.Module, file_path: str, file_loc: int) -> list[LintFinding]:
+    """Flag excessively large files, functions, and classes."""
+    findings = []
+
+    if file_loc > GOD_FILE_LOC:
+        findings.append(LintFinding(
+            file_path=file_path,
+            line=1,
+            rule="GOD_FILE",
+            severity="med",
+            desc=f"File has {file_loc} lines (threshold: {GOD_FILE_LOC}) — consider splitting into smaller modules",
+        ))
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_loc = (node.end_lineno or node.lineno) - node.lineno + 1
+            if func_loc > GOD_FUNC_LOC:
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="GOD_FUNCTION",
+                    severity="med",
+                    desc=f"Function '{node.name}' is {func_loc} lines (threshold: {GOD_FUNC_LOC}) — consider extracting helper functions",
+                ))
+
+            complexity = 1
+            for child in ast.walk(node):
+                if isinstance(child, (ast.If, ast.While, ast.For, ast.ExceptHandler)):
+                    complexity += 1
+                elif isinstance(child, ast.BoolOp):
+                    complexity += len(child.values) - 1
+            if complexity > GOD_FUNC_COMPLEXITY:
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="GOD_FUNCTION_COMPLEXITY",
+                    severity="med",
+                    desc=f"Function '{node.name}' has cyclomatic complexity {complexity} (threshold: {GOD_FUNC_COMPLEXITY}) — too many branches",
+                ))
+
+        elif isinstance(node, ast.ClassDef):
+            method_count = sum(1 for child in node.body
+                              if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            if method_count > GOD_CLASS_METHODS:
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="GOD_CLASS",
+                    severity="med",
+                    desc=f"Class '{node.name}' has {method_count} methods (threshold: {GOD_CLASS_METHODS}) — consider splitting responsibilities",
+                ))
+
+    return findings
+
+
+def _check_unreachable_code(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect statements after return, break, continue, raise within a function."""
+    findings = []
+    _TERMINAL = (ast.Return, ast.Break, ast.Continue, ast.Raise)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.For, ast.While, ast.If, ast.ExceptHandler,
+                                 ast.With, ast.AsyncWith)):
+            continue
+
+        body = getattr(node, 'body', [])
+        _check_body_for_unreachable(body, file_path, findings, _TERMINAL)
+
+        orelse = getattr(node, 'orelse', [])
+        if orelse:
+            _check_body_for_unreachable(orelse, file_path, findings, _TERMINAL)
+
+        handlers = getattr(node, 'handlers', [])
+        for handler in handlers:
+            _check_body_for_unreachable(handler.body, file_path, findings, _TERMINAL)
+
+        finalbody = getattr(node, 'finalbody', [])
+        if finalbody:
+            _check_body_for_unreachable(finalbody, file_path, findings, _TERMINAL)
+
+    return findings
+
+
+def _check_body_for_unreachable(body: list, file_path: str,
+                                 findings: list[LintFinding], terminal_types: tuple):
+    """Check a block of statements for code after a terminal statement."""
+    for i, stmt in enumerate(body):
+        if isinstance(stmt, terminal_types) and i < len(body) - 1:
+            next_stmt = body[i + 1]
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=next_stmt.lineno,
+                rule="UNREACHABLE_CODE",
+                severity="high",
+                desc=f"Code after {type(stmt).__name__.lower()} statement is unreachable",
+            ))
+            break
 
 
 def _check_self_assign_in_except(tree: ast.Module, file_path: str) -> list[LintFinding]:
