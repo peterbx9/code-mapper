@@ -14,7 +14,8 @@ from .schema import RepoMap, LogicBlock, NodeType, EdgeType
 logger = logging.getLogger(__name__)
 
 
-def cluster_logic_blocks(repo_map: RepoMap, resolution: float = 1.0) -> list[LogicBlock]:
+def cluster_logic_blocks(repo_map: RepoMap, resolution: float = 1.0,
+                         merge_singletons: bool = True) -> list[LogicBlock]:
     file_nodes = [n for n in repo_map.nodes if n.type == NodeType.FILE]
     if not file_nodes:
         return []
@@ -58,7 +59,42 @@ def cluster_logic_blocks(repo_map: RepoMap, resolution: float = 1.0) -> list[Log
         block.shared_tables = _find_shared(block.node_ids, repo_map, "tables")
         block.shared_imports = _find_shared_imports(block.node_ids, repo_map)
 
+    if merge_singletons:
+        blocks = _merge_singletons(blocks)
+
     return blocks
+
+
+def _merge_singletons(blocks: list[LogicBlock]) -> list[LogicBlock]:
+    multi = [b for b in blocks if len(b.node_ids) > 1]
+    singles = [b for b in blocks if len(b.node_ids) == 1]
+
+    if len(singles) <= 1:
+        return blocks
+
+    standalone_ids = []
+    standalone_tables = []
+    standalone_imports = []
+    for s in singles:
+        standalone_ids.extend(s.node_ids)
+        standalone_tables.extend(s.shared_tables)
+        standalone_imports.extend(s.shared_imports)
+
+    utility_block = LogicBlock(
+        id=f"block:utilities",
+        name="Utilities / Standalone",
+        node_ids=sorted(standalone_ids),
+        shared_tables=sorted(set(standalone_tables)),
+        shared_imports=sorted(set(standalone_imports)),
+    )
+
+    result = multi + [utility_block]
+
+    for i, block in enumerate(result):
+        if block.id != "block:utilities":
+            block.id = f"block:{i}"
+
+    return result
 
 
 def _louvain_cluster(file_nodes, affinity, resolution) -> list[LogicBlock]:

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "code-mapper"
+version = "0.1.0"
+description = "Parse any codebase into a structured map of nodes, edges, and logic blocks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = []
+
+[project.optional-dependencies]
+clustering = ["networkx>=3.0"]
+all = ["networkx>=3.0"]
+
+[project.scripts]
+code-mapper = "code_mapper.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

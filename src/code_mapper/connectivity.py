@@ -61,13 +61,18 @@ def analyze_connectivity(repo_map: RepoMap):
 
     structural_files = set()
     schema_files = set()
+    config_files = set()
     standalone_scripts = set()
+    _CONFIG_NAMES = {"config", "settings", "constants", "defaults", "env"}
     for node in file_nodes:
         basename = node.path.split("/")[-1]
+        stem = basename.replace(".py", "")
         if basename == "__init__.py":
             structural_files.add(node.id)
         if "/schemas/" in node.path or "schemas/" in node.path:
             schema_files.add(node.id)
+        if stem in _CONFIG_NAMES and not node.routes and not node.tables:
+            config_files.add(node.id)
         if "/" not in node.path or node.path.startswith("tols-pbj/") or node.path.startswith("updates/"):
             standalone_scripts.add(node.id)
 
@@ -90,7 +95,7 @@ def analyze_connectivity(repo_map: RepoMap):
                 node.connectivity = ConnectivityStatus.UNREACHABLE
                 unreachable.append(node.id)
         elif in_reachable and not in_effect and node.id not in effect_nodes:
-            if node.id in schema_files:
+            if node.id in schema_files or node.id in config_files:
                 node.connectivity = ConnectivityStatus.REACHABLE
             else:
                 node.connectivity = ConnectivityStatus.INCOMPLETE

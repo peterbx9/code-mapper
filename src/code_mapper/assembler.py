@@ -76,6 +76,7 @@ def assemble_map(project_root: Path, config: Optional[dict] = None) -> RepoMap:
     repo_map.edges = all_edges
 
     _resolve_edges(repo_map)
+    _resolve_relationship_tables(repo_map)
 
     file_count = sum(1 for n in all_nodes if n.type == NodeType.FILE)
     class_count = sum(1 for n in all_nodes if n.type == NodeType.CLASS)
@@ -232,6 +233,30 @@ def _get_exported_names(file_node: Node, repo_map: RepoMap) -> list[str]:
             short_name = node.name.split(".")[-1] if "." in node.name else node.name
             names.append(short_name)
     return names
+
+
+def _resolve_relationship_tables(repo_map: RepoMap):
+    model_to_table = {}
+    for node in repo_map.nodes:
+        if node.type == NodeType.CLASS:
+            for table in (repo_map.get_node(node.parent_id) or Node(id="", type=NodeType.FILE, path="", name="")).tables:
+                if not table.startswith("rel:"):
+                    class_name = node.name.split(".")[-1] if "." in node.name else node.name
+                    model_to_table[class_name] = table
+
+    for node in repo_map.nodes:
+        resolved_tables = []
+        for table in node.tables:
+            if table.startswith("rel:"):
+                model_name = table[4:]
+                actual_table = model_to_table.get(model_name)
+                if actual_table:
+                    resolved_tables.append(f"{actual_table} (via {model_name})")
+                else:
+                    resolved_tables.append(table)
+            else:
+                resolved_tables.append(table)
+        node.tables = resolved_tables
 
 
 def _is_stdlib_or_external(module_ref: str) -> bool:
