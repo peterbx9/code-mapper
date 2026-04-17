@@ -102,6 +102,7 @@ def build_xref(project_root: Path, repo_map: RepoMap, exclude_dirs: set = None) 
     _scan_module_level_symbols(project_root, repo_map, xref, exclude_dirs)
     _scan_internal_references(project_root, repo_map, xref)
     _scan_references(project_root, repo_map, xref, exclude_dirs)
+    xref._repo_map = repo_map
     _detect_cross_file_issues(xref)
 
     return xref
@@ -277,6 +278,45 @@ def _get_imports_map(tree: ast.Module) -> dict:
     return mapping
 
 
+def _find_decorated_handlers(xref: XRefTable) -> set:
+    handlers = set()
+    FRAMEWORK_DECORATORS = {"get", "post", "put", "delete", "patch", "head", "options",
+                            "route", "websocket", "on_event", "middleware"}
+    for key, sym in xref.symbols.items():
+        if sym.type != "function":
+            continue
+        node = _find_node_in_repo(xref, sym)
+        if node and node.decorators:
+            for dec in node.decorators:
+                dec_parts = dec.lower().split(".")
+                if any(part in FRAMEWORK_DECORATORS for part in dec_parts):
+                    handlers.add(key)
+                    break
+    return handlers
+
+
+def _find_depends_targets(xref: XRefTable) -> set:
+    targets = set()
+    DEPENDS_INJECTED = {"get_db", "get_current_user", "require_admin", "require_permission",
+                        "get_session", "get_token"}
+    for key, sym in xref.symbols.items():
+        if sym.name in DEPENDS_INJECTED:
+            targets.add(sym.name)
+    return targets
+
+
+def _find_node_in_repo(xref: XRefTable, sym: SymbolRef):
+    if not hasattr(xref, '_repo_map'):
+        return None
+    repo_map = xref._repo_map
+    for node in repo_map.nodes:
+        if node.type == NodeType.FUNCTION and node.path == sym.defined_in:
+            short = node.name.split(".")[-1] if "." in node.name else node.name
+            if short == sym.name and node.line_start == sym.defined_line:
+                return node
+    return None
+
+
 def _get_call_name(node: ast.Call) -> Optional[str]:
     func = node.func
     if isinstance(func, ast.Name):
@@ -289,10 +329,17 @@ def _get_call_name(node: ast.Call) -> Optional[str]:
 
 
 def _detect_cross_file_issues(xref: XRefTable):
+    decorated_handlers = _find_decorated_handlers(xref)
+    depends_functions = _find_depends_targets(xref)
+
     for key, sym in xref.symbols.items():
         if sym.name.startswith("_"):
             continue
         if sym.name in ("__init__", "__main__", "main"):
+            continue
+        if key in decorated_handlers:
+            continue
+        if sym.name in depends_functions:
             continue
 
         internally_used = sym.name in xref._internal_refs.get(sym.defined_in, set())

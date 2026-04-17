@@ -124,7 +124,8 @@ def _check_dead_imports(tree: ast.Module, file_path: str) -> list[LintFinding]:
 
 def _check_unused_params(tree: ast.Module, file_path: str) -> list[LintFinding]:
     findings = []
-    SKIP_PARAMS = {"self", "cls", "args", "kwargs", "db", "request", "response", "_"}
+    SKIP_PARAMS = {"self", "cls", "args", "kwargs", "db", "request", "response", "_",
+                   "user", "current_user", "session", "token", "background_tasks"}
 
     for node in ast.walk(tree):
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
