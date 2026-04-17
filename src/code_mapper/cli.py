@@ -37,7 +37,9 @@ def main():
     parser.add_argument("--xref", action="store_true", help="Build cross-reference symbol table (Tier 1.5)")
     parser.add_argument("--ai", action="store_true", help="Tier 2: AI review per file via Ollama")
     parser.add_argument("--deep", action="store_true", help="Tier 2 deep: 7B triage + 32B deep-dive on flagged files")
+    parser.add_argument("--claude", action="store_true", help="Tier 3: Claude API deep review of flagged files")
     parser.add_argument("--verify", action="store_true", help="Tier 2 v3: targeted yes/no questions from structural signals")
+    parser.add_argument("--todo", default=None, help="Path to TODO/changelog doc for doc-vs-code verification")
     parser.add_argument("--model", default=None, help="Ollama triage model (default: qwen2.5-coder:7b)")
     parser.add_argument("--deep-model", default=None, help="Ollama deep model (default: qwen2.5-coder:32b)")
     parser.add_argument("--ollama-url", default=None, help="Ollama API URL (default: http://127.0.0.1:11434)")
@@ -170,11 +172,13 @@ def main():
         ollama = args.ollama_url or "http://127.0.0.1:11434"
 
         print(f"\n  TARGETED VERIFICATION (model: {verify_model}):")
+        todo_file = Path(args.todo) if args.todo else None
         verify_findings = generate_and_verify(
             project_root, repo_map,
             xref_data=xref_data_for_verify,
             model=verify_model,
             ollama_url=ollama,
+            todo_path=todo_file,
         )
         if verify_findings:
             print(f"  VERIFIED BUGS ({len(verify_findings)}):")
@@ -185,6 +189,50 @@ def main():
             repo_map.stats["verified_findings"] = verify_findings
         else:
             print("  Verification: all checks passed")
+
+    if args.claude:
+        from .deep_reviewer import deep_review
+        all_prior = []
+        if "lint_findings" in repo_map.stats:
+            all_prior.extend(repo_map.stats["lint_findings"])
+        if "xref" in repo_map.stats and "findings" in repo_map.stats["xref"]:
+            all_prior.extend(repo_map.stats["xref"]["findings"])
+        if "verified_findings" in repo_map.stats:
+            all_prior.extend(repo_map.stats["verified_findings"])
+        if "ai_findings" in repo_map.stats:
+            all_prior.extend(repo_map.stats["ai_findings"])
+
+        flagged = [n.path for n in repo_map.nodes
+                   if n.type == NodeType.FILE and n.connectivity.value in ("unreachable", "incomplete")]
+
+        todo_content = None
+        if args.todo:
+            todo_file = Path(args.todo)
+            if todo_file.exists():
+                todo_content = todo_file.read_text(encoding="utf-8", errors="replace")
+
+        print(f"\n  CLAUDE DEEP REVIEW (Tier 3):")
+        claude_findings = deep_review(
+            project_root, repo_map,
+            prior_findings=all_prior,
+            flagged_files=flagged,
+            todo_content=todo_content,
+        )
+        if claude_findings:
+            print(f"  CLAUDE FINDINGS ({len(claude_findings)}):")
+            for f in claude_findings:
+                sev = f.get("severity", "?")
+                fp = f.get("file", "?")
+                ln = f.get("line", "?")
+                cat = f.get("category", "?")
+                desc = f.get("desc", "?")
+                evidence = f.get("evidence", "")
+                print(f"    [{sev}] {fp}:{ln} [{cat}]: {desc}")
+                if evidence:
+                    print(f"           Evidence: {evidence}")
+            repo_map.stats["claude_findings"] = claude_findings
+        else:
+            print("  Claude: no additional findings")
 
     output_path = Path(args.output) if args.output else project_root / "repo-map.json"
     output_path.write_text(repo_map.to_json(), encoding="utf-8")

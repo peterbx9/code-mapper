@@ -64,10 +64,11 @@ class TargetedQuestion:
 def generate_and_verify(project_root: Path, repo_map: RepoMap,
                         xref_data: dict = None,
                         model: str = "qwen2.5-coder:7b",
-                        ollama_url: str = "http://127.0.0.1:11434") -> list[dict]:
+                        ollama_url: str = "http://127.0.0.1:11434",
+                        todo_path: Path = None) -> list[dict]:
     project_root = project_root.resolve()
 
-    questions = _generate_questions(project_root, repo_map, xref_data)
+    questions = _generate_questions(project_root, repo_map, xref_data, todo_path)
     logger.info(f"Generated {len(questions)} targeted questions")
 
     if not questions:
@@ -106,7 +107,8 @@ def generate_and_verify(project_root: Path, repo_map: RepoMap,
 
 
 def _generate_questions(project_root: Path, repo_map: RepoMap,
-                        xref_data: dict = None) -> list[TargetedQuestion]:
+                        xref_data: dict = None,
+                        todo_path: Path = None) -> list[TargetedQuestion]:
     questions = []
 
     has_connectivity = any(
@@ -121,6 +123,10 @@ def _generate_questions(project_root: Path, repo_map: RepoMap,
     questions.extend(_questions_from_xref(project_root, repo_map, xref_data))
     questions.extend(_questions_from_soft_delete(project_root, repo_map))
     questions.extend(_questions_from_loaded_fields(project_root, repo_map))
+    questions.extend(_questions_from_temporal_ordering(project_root, repo_map))
+    questions.extend(_questions_from_constraint_enforcement(project_root, repo_map))
+    if todo_path:
+        questions.extend(_questions_from_doc_vs_code(project_root, repo_map, todo_path))
 
     return questions
 
@@ -323,6 +329,231 @@ def _questions_from_loaded_fields(project_root: Path, repo_map: RepoMap) -> list
                         source_signal="expiration field set with datetime.now but no timedelta offset",
                         bug_if_no="Expiration set to current time — tokens/invites expire instantly",
                     ))
+
+    return questions
+
+
+def _questions_from_temporal_ordering(project_root: Path, repo_map: RepoMap) -> list[TargetedQuestion]:
+    """Detect db.commit() before async completion, close() before flush, etc."""
+    questions = []
+
+    ASYNC_PATTERNS = ["ensure_future", "create_task", "asyncio.gather", "run_in_executor"]
+    COMMIT_PATTERNS = ["db.commit()", "session.commit()", ".commit()"]
+    CLOSE_PATTERNS = [".close()", "db.close()", "session.close()"]
+
+    for node in repo_map.nodes:
+        if node.type != NodeType.FILE:
+            continue
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        has_async = any(p in source for p in ASYNC_PATTERNS)
+        has_commit = any(p in source for p in COMMIT_PATTERNS)
+        has_close = any(p in source for p in CLOSE_PATTERNS)
+
+        if not ((has_async and has_commit) or (has_async and has_close)):
+            continue
+
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+
+        for ast_node in ast.walk(tree):
+            if not isinstance(ast_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+
+            func_lines = source.splitlines()[ast_node.lineno - 1:(ast_node.end_lineno or ast_node.lineno)]
+            func_source = "\n".join(func_lines)
+
+            func_has_async = any(p in func_source for p in ASYNC_PATTERNS)
+            func_has_commit = any(p in func_source for p in COMMIT_PATTERNS)
+            func_has_close = any(p in func_source for p in CLOSE_PATTERNS)
+
+            if func_has_async and func_has_commit:
+                questions.append(TargetedQuestion(
+                    file_path=node.path,
+                    question=f"In function '{ast_node.name}', is db.commit() or session.commit() called AFTER the async operation (ensure_future/create_task/gather) has completed? Or does the commit happen BEFORE the async result is available?",
+                    code_snippet=func_source,
+                    start_line=ast_node.lineno,
+                    end_line=ast_node.end_lineno or ast_node.lineno,
+                    source_signal="Function has both async dispatch and db.commit — temporal ordering risk",
+                    bug_if_no="db.commit() runs before async task completes — database writes from the async task are silently lost",
+                ))
+
+            if func_has_async and func_has_close:
+                questions.append(TargetedQuestion(
+                    file_path=node.path,
+                    question=f"In function '{ast_node.name}', is the resource (db/session/connection) closed AFTER the async operation has completed? Or does close() happen while the async task is still running?",
+                    code_snippet=func_source,
+                    start_line=ast_node.lineno,
+                    end_line=ast_node.end_lineno or ast_node.lineno,
+                    source_signal="Function has both async dispatch and resource close — temporal ordering risk",
+                    bug_if_no="Resource closed before async task completes — async task operates on closed connection",
+                ))
+
+    return questions
+
+
+def _questions_from_constraint_enforcement(project_root: Path, repo_map: RepoMap) -> list[TargetedQuestion]:
+    """When a constraint (e.g., 150-char cap) is enforced in one file, check sibling consumers."""
+    questions = []
+
+    CONSTRAINT_PATTERNS = [
+        {"search": "[:147]", "desc": "150-char truncation", "field": "alt.text|alt_text"},
+        {"search": "[:125]", "desc": "125-char truncation", "field": "alt.text|alt_text"},
+        {"search": "max_length", "desc": "max_length constraint", "field": None},
+    ]
+
+    enforcer_files = {}
+
+    for node in repo_map.nodes:
+        if node.type != NodeType.FILE:
+            continue
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        for pattern in CONSTRAINT_PATTERNS:
+            if pattern["search"] in source:
+                key = pattern["desc"]
+                if key not in enforcer_files:
+                    enforcer_files[key] = []
+                enforcer_files[key].append(node.path)
+
+    for constraint_desc, enforcer_paths in enforcer_files.items():
+        for node in repo_map.nodes:
+            if node.type != NodeType.FILE:
+                continue
+            if node.path in enforcer_paths:
+                continue
+
+            file_path = project_root / node.path
+            if not file_path.exists():
+                continue
+            try:
+                source = file_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+
+            for cp in CONSTRAINT_PATTERNS:
+                if cp["desc"] != constraint_desc:
+                    continue
+                if not cp["field"]:
+                    continue
+
+                field_patterns = cp["field"].split("|")
+                if not any(fp in source.lower() for fp in field_patterns):
+                    continue
+
+                has_write = any(kw in source.lower() for kw in [
+                    "pikepdf", "write", "save", "set_alt", "apply", "remediat"
+                ])
+                if not has_write:
+                    continue
+
+                try:
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    continue
+
+                for ast_node in ast.walk(tree):
+                    if not isinstance(ast_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    func_lines = source.splitlines()[ast_node.lineno - 1:(ast_node.end_lineno or ast_node.lineno)]
+                    func_source = "\n".join(func_lines)
+
+                    if not any(fp in func_source.lower() for fp in field_patterns):
+                        continue
+
+                    questions.append(TargetedQuestion(
+                        file_path=node.path,
+                        question=f"In function '{ast_node.name}', is the {constraint_desc} enforced before writing/applying the value? (It IS enforced in {', '.join(enforcer_paths)} but this file also handles the same data.)",
+                        code_snippet=func_source,
+                        start_line=ast_node.lineno,
+                        end_line=ast_node.end_lineno or ast_node.lineno,
+                        source_signal=f"{constraint_desc} enforced in {enforcer_paths} but {node.path} also writes this field",
+                        bug_if_no=f"{constraint_desc} not enforced in {node.path} — constraint bypassed when data flows through this path",
+                    ))
+                break
+
+    return questions
+
+
+def _questions_from_doc_vs_code(project_root: Path, repo_map: RepoMap,
+                                todo_path: Path) -> list[TargetedQuestion]:
+    """Parse a TODO/changelog doc for items marked DONE, verify each claim against code."""
+    questions = []
+
+    if not todo_path.exists():
+        return questions
+
+    try:
+        todo_content = todo_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return questions
+
+    CLAIM_PATTERNS = [
+        {"claim": "MAX_RETRIES", "search_in": "link_checker", "question": "Does this file contain a MAX_RETRIES constant or retry loop with exponential backoff?"},
+        {"claim": "Semaphore", "search_in": "link_checker", "question": "Does this file use asyncio.Semaphore to limit concurrent requests?"},
+        {"claim": "deleted_at", "search_in": "ada_checker", "question": "Does this file filter queries using 'deleted_at IS NULL' or 'deleted_at == None'?"},
+        {"claim": "cli.py", "search_in": "cli", "question": "Does this file exist and contain init-db, seed, and create-admin commands?"},
+    ]
+
+    import re
+    done_items = []
+    for line in todo_content.splitlines():
+        if "**DONE**" in line or "✅" in line or "FIXED" in line:
+            done_items.append(line.strip())
+
+    for cp in CLAIM_PATTERNS:
+        claimed_done = any(cp["claim"].lower() in item.lower() for item in done_items)
+        if not claimed_done:
+            continue
+
+        target_file = None
+        for node in repo_map.nodes:
+            if node.type == NodeType.FILE and cp["search_in"] in node.path:
+                target_file = node
+                break
+
+        if not target_file:
+            questions.append(TargetedQuestion(
+                file_path=f"(missing: *{cp['search_in']}*)",
+                question=cp["question"],
+                code_snippet="FILE NOT FOUND",
+                start_line=0,
+                end_line=0,
+                source_signal=f"TODO claims '{cp['claim']}' is DONE but target file not found",
+                bug_if_no=f"TODO regression: '{cp['claim']}' claimed done but file doesn't exist",
+            ))
+            continue
+
+        file_path = project_root / target_file.path
+        if not file_path.exists():
+            continue
+
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+
+        questions.append(TargetedQuestion(
+            file_path=target_file.path,
+            question=cp["question"],
+            code_snippet=source[:3000],
+            start_line=1,
+            end_line=min(len(source.splitlines()), 100),
+            source_signal=f"TODO claims '{cp['claim']}' is DONE — verifying against code",
+            bug_if_no=f"TODO regression: '{cp['claim']}' claimed done but not found in code",
+        ))
 
     return questions
 
