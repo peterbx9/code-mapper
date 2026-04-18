@@ -510,7 +510,6 @@ def _questions_from_doc_vs_code(project_root: Path, repo_map: RepoMap,
         {"claim": "cli.py", "search_in": "cli", "question": "Does this file exist and contain init-db, seed, and create-admin commands?"},
     ]
 
-    import re
     done_items = []
     for line in todo_content.splitlines():
         if "**DONE**" in line or "✅" in line or "FIXED" in line:

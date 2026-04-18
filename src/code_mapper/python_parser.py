@@ -11,7 +11,6 @@ Extracts from .py files:
 """
 
 import ast
-import re
 import logging
 from pathlib import Path
 from typing import Optional
@@ -21,6 +20,11 @@ from .schema import Node, Edge, NodeType, EdgeType, EdgeFlag
 logger = logging.getLogger(__name__)
 
 FASTAPI_ROUTE_DECORATORS = {"get", "post", "put", "delete", "patch", "head", "options"}
+# Flask / Bottle / Pyramid use @bp.route("/path", methods=["GET"]) style.
+# Treat "route" as a route-declaring decorator too — the HTTP method lives in
+# the methods= kwarg rather than the decorator name.
+FLASK_ROUTE_DECORATORS = {"route"}
+ALL_ROUTE_DECORATORS = FASTAPI_ROUTE_DECORATORS | FLASK_ROUTE_DECORATORS
 ROUTER_FACTORIES = {"APIRouter", "FastAPI"}
 
 
@@ -118,32 +122,59 @@ def _extract_routes_from_module(tree: ast.Module, file_node: Node, source: str):
             func = node.func
             if isinstance(func, ast.Attribute) and func.attr == "include_router":
                 route_info = {"type": "include_router", "line": node.lineno}
+                prefix_kw_present = False
                 for kw in node.keywords:
-                    if kw.arg == "prefix" and isinstance(kw.value, ast.Constant):
-                        val = kw.value.value
-                        route_info["prefix"] = val
+                    if kw.arg == "prefix":
+                        prefix_kw_present = True
+                        if isinstance(kw.value, ast.Constant):
+                            route_info["prefix"] = kw.value.value
+                        else:
+                            # Variable / expression prefix — the route IS
+                            # prefixed, just not statically resolvable. Don't
+                            # confuse this with the genuinely-missing case.
+                            route_info["prefix"] = "<dynamic>"
+                            route_info["warning"] = "include_router prefix is dynamic"
                     elif kw.arg == "tags":
                         pass
-                if "prefix" not in route_info:
+                if not prefix_kw_present:
                     route_info["prefix"] = None
                     route_info["warning"] = "include_router called without prefix"
                 file_node.routes.append(route_info)
 
 
 def _parse_route_decorator(dec) -> Optional[dict]:
-    if isinstance(dec, ast.Call):
-        func = dec.func
-        method = None
-        if isinstance(func, ast.Attribute) and func.attr in FASTAPI_ROUTE_DECORATORS:
-            method = func.attr.upper()
-        elif isinstance(func, ast.Name) and func.id in FASTAPI_ROUTE_DECORATORS:
-            method = func.id.upper()
+    if not isinstance(dec, ast.Call):
+        return None
+    func = dec.func
 
-        if method and dec.args:
-            path_arg = dec.args[0]
-            if isinstance(path_arg, ast.Constant):
-                path = path_arg.value
-                return {"method": method, "path": str(path)}
+    # FastAPI / Starlette: @app.get("/path")
+    decorator_name = None
+    if isinstance(func, ast.Attribute):
+        decorator_name = func.attr
+    elif isinstance(func, ast.Name):
+        decorator_name = func.id
+    if decorator_name is None:
+        return None
+
+    method = None
+    if decorator_name in FASTAPI_ROUTE_DECORATORS:
+        method = decorator_name.upper()
+    elif decorator_name in FLASK_ROUTE_DECORATORS:
+        # Flask @bp.route("/x", methods=["POST"]) — find the methods kwarg
+        method = "GET"  # Flask default
+        for kw in dec.keywords:
+            if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                methods = [
+                    elt.value.upper() for elt in kw.value.elts
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                ]
+                if methods:
+                    method = "/".join(methods)  # e.g. "GET/POST"
+
+    if method and dec.args:
+        path_arg = dec.args[0]
+        if isinstance(path_arg, ast.Constant):
+            return {"method": method, "path": str(path_arg.value)}
     return None
 
 

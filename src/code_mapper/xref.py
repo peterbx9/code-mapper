@@ -280,9 +280,22 @@ def _get_imports_map(tree: ast.Module) -> dict:
 
 
 def _find_decorated_handlers(xref: XRefTable) -> set:
+    """Symbols whose decorator makes them framework-invoked (not 'unused').
+    Includes HTTP verbs (FastAPI, Flask route, Blueprint), event hooks, and
+    caching/property decorators that wrap the function but still expose it
+    under its bare name."""
     handlers = set()
-    FRAMEWORK_DECORATORS = {"get", "post", "put", "delete", "patch", "head", "options",
-                            "route", "websocket", "on_event", "middleware"}
+    FRAMEWORK_DECORATORS = {
+        # Route / HTTP
+        "get", "post", "put", "delete", "patch", "head", "options",
+        "route", "websocket", "on_event", "middleware",
+        # Property / caching — invoked as bare attribute, never as .name()
+        "property", "cached_property", "lru_cache", "cache",
+        # Class-method forms
+        "staticmethod", "classmethod",
+        # Common event / signal hooks
+        "register", "listener", "event", "signal", "task", "celery",
+    }
     for key, sym in xref.symbols.items():
         if sym.type != "function":
             continue
@@ -301,12 +314,25 @@ def _find_depends_targets(xref: XRefTable) -> set:
     DEPENDS_INJECTED = {"get_db", "get_current_user", "require_admin", "require_permission",
                         "get_session", "get_token"}
     FRAMEWORK_OVERRIDES = {
+        # HTMLParser
         "handle_starttag", "handle_endtag", "handle_data", "handle_startendtag",
         "handle_comment", "handle_decl", "handle_pi", "handle_charref",
         "handle_entityref", "feed", "close", "reset",
+        # unittest
         "setUp", "tearDown", "setUpClass", "tearDownClass",
-        "test_", "__enter__", "__exit__", "__repr__", "__str__",
+        "test_",
+        # BaseHTTPRequestHandler — previously missing, caused false "unused"
+        # flags on shadow_server.py style code.
+        "do_GET", "do_POST", "do_PUT", "do_DELETE", "do_HEAD",
+        "do_OPTIONS", "do_PATCH", "do_TRACE", "do_CONNECT",
+        "log_message", "log_request", "log_error", "version_string",
+        "send_error", "send_response", "send_header", "end_headers",
+        # Common dunder methods invoked by Python itself, not by name
+        "__enter__", "__exit__", "__repr__", "__str__",
         "__init__", "__del__", "__hash__", "__eq__", "__lt__", "__gt__",
+        "__le__", "__ge__", "__ne__", "__call__", "__iter__", "__next__",
+        "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__",
+        "__enter__", "__exit__", "__aenter__", "__aexit__",
     }
     for key, sym in xref.symbols.items():
         if sym.name in DEPENDS_INJECTED:
