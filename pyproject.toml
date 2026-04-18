@@ -14,7 +14,9 @@ dependencies = []
 
 [project.optional-dependencies]
 clustering = ["networkx>=3.0"]
-all = ["networkx>=3.0"]
+ai = ["httpx>=0.24"]                         # Ollama tier 2 (--verify / --ai)
+claude = ["httpx>=0.24"]                     # Claude API tier 3 (--claude)
+all = ["networkx>=3.0", "httpx>=0.24"]
 
 [project.scripts]
 code-mapper = "code_mapper.cli:main"

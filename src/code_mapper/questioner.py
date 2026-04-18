@@ -75,16 +75,39 @@ def generate_and_verify(project_root: Path, repo_map: RepoMap,
         return []
 
     if not _check_ollama(ollama_url):
+        # Return a sentinel finding so callers can distinguish "no findings"
+        # from "never ran". Previously both returned [] and the CLI printed
+        # "Verification: all checks passed" when verification never happened.
         logger.error(f"Ollama not reachable at {ollama_url}")
-        return []
+        return [{
+            "file": "-",
+            "line": 0,
+            "severity": "high",
+            "category": "tool_failure",
+            "source": "questioner",
+            "bug_desc": f"Ollama unreachable at {ollama_url}; verification SKIPPED — "
+                        f"results are not 'clean', they are UNKNOWN",
+            "signal": "no_ollama",
+        }]
 
     findings = []
+    # Track responses we accepted as "no" to detect ambiguous LLM replies.
+    AMBIGUOUS_SUFFIXES = ("probably", "unlikely", "unclear", "maybe")
     for q in questions:
         t0 = time.time()
         result = _ask_question(q, model, ollama_url)
         elapsed = time.time() - t0
 
-        if result and result.get("answer", "").lower() == "no":
+        # Match literal "no" / "false" only; log anything else as ambiguous.
+        raw_answer = (result.get("answer", "") if result else "").strip().lower()
+        is_no = raw_answer in ("no", "false")
+        if result and not is_no and any(s in raw_answer for s in AMBIGUOUS_SUFFIXES):
+            logger.warning(
+                f"Ambiguous answer for {q.file_path}:{q.start_line} → "
+                f"{raw_answer!r} (treated as YES)"
+            )
+
+        if is_no:
             finding = {
                 "file": q.file_path,
                 "line": result.get("line", q.start_line),

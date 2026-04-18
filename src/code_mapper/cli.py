@@ -5,7 +5,7 @@ Usage:
     python -m code_mapper /path/to/project
     python -m code_mapper /path/to/project --output my-map.json
     python -m code_mapper /path/to/project --verbose
-    python -m code_mapper /path/to/project --force
+    python -m code_mapper /path/to/project --lint --xref
 """
 
 import argparse
@@ -18,6 +18,7 @@ from .assembler import assemble_map, load_config
 from .clustering import cluster_logic_blocks
 from .connectivity import analyze_connectivity
 from .linter import lint_project
+from .schema import NodeType
 from .xref import build_xref
 
 
@@ -29,7 +30,8 @@ def main():
     parser.add_argument("project", help="Path to project root")
     parser.add_argument("--output", "-o", default=None, help="Output file (default: repo-map.json in project root)")
     parser.add_argument("--config", "-c", default=None, help="Path to .codemapper.json (default: project root)")
-    parser.add_argument("--force", "-f", action="store_true", help="Force full rebuild (ignore cache)")
+    # --force was declared but never implemented (no cache layer exists).
+    # Removed to stop promising a feature that doesn't work.
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     parser.add_argument("--no-cluster", action="store_true", help="Skip logic block clustering")
     parser.add_argument("--no-connectivity", action="store_true", help="Skip connectivity analysis")
@@ -50,17 +52,35 @@ def main():
     logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
 
     project_root = Path(args.project).resolve()
+    if not project_root.exists():
+        print(f"Error: {project_root} does not exist", file=sys.stderr)
+        sys.exit(1)
     if not project_root.is_dir():
         print(f"Error: {project_root} is not a directory", file=sys.stderr)
         sys.exit(1)
+
+    # Validate output dir is writable BEFORE running (potentially slow) tiers,
+    # so --ai / --verify / --claude don't do expensive work and then fail at
+    # the final write step.
+    if args.output:
+        out_parent = Path(args.output).parent
+        if out_parent and not out_parent.exists():
+            print(f"Error: output directory {out_parent} does not exist", file=sys.stderr)
+            sys.exit(1)
 
     config = None
     if args.config:
         config_path = Path(args.config)
         if config_path.exists():
-            config = json.loads(config_path.read_text(encoding="utf-8"))
+            try:
+                config = json.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"Warning: {config_path} unreadable ({e}) — using defaults",
+                      file=sys.stderr)
+                config = {}
         else:
             print(f"Warning: config file {config_path} not found, using defaults", file=sys.stderr)
+            config = {}
     else:
         config = load_config(project_root)
 
@@ -102,7 +122,7 @@ def main():
 
     if args.lint:
         from .assembler import DEFAULT_EXCLUDE
-        exclude = set(config.get("exclude", [])) | DEFAULT_EXCLUDE if config else DEFAULT_EXCLUDE
+        exclude = DEFAULT_EXCLUDE | set((config or {}).get("exclude", []))
         lint_findings = lint_project(project_root, repo_map, exclude_dirs=exclude)
         if lint_findings:
             print(f"  LINT FINDINGS ({len(lint_findings)}):")
@@ -114,7 +134,7 @@ def main():
 
     if args.xref:
         from .assembler import DEFAULT_EXCLUDE
-        exclude = set(config.get("exclude", [])) | DEFAULT_EXCLUDE if config else DEFAULT_EXCLUDE
+        exclude = DEFAULT_EXCLUDE | set((config or {}).get("exclude", []))
         xref = build_xref(project_root, repo_map, exclude_dirs=exclude)
         xref_data = xref.to_dict()
         stats = xref_data["stats"]
@@ -240,7 +260,20 @@ def main():
             print("  Claude: no additional findings")
 
     output_path = Path(args.output) if args.output else project_root / "repo-map.json"
-    output_path.write_text(repo_map.to_json(), encoding="utf-8")
+    # Atomic write: tmp + rename avoids a half-written repo-map.json if
+    # the process crashes or is interrupted mid-write.
+    tmp_output = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        tmp_output.write_text(repo_map.to_json(), encoding="utf-8")
+        import os as _os
+        _os.replace(tmp_output, output_path)
+    except OSError as e:
+        print(f"\nError: failed to write {output_path}: {e}", file=sys.stderr)
+        try:
+            tmp_output.unlink(missing_ok=True)
+        except OSError:
+            pass
+        sys.exit(1)
     print(f"\nMap written to: {output_path}")
 
 

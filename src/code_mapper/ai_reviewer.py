@@ -119,10 +119,21 @@ def review_project(project_root: Path, repo_map: RepoMap,
         if not file_path.exists():
             continue
 
-        source = file_path.read_text(encoding="utf-8", errors="replace")
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            logger.warning(f"Can't read {node.path}: {e} — skipping")
+            continue
         lines = source.splitlines()
         if len(lines) < 5:
             continue
+        # 7B context is ~8K tokens; rough budget for source is ~3000 lines.
+        # Silent server-side truncation produces garbage reviews — warn loudly.
+        if len(lines) > 3000:
+            logger.warning(
+                f"{node.path}: {len(lines)} lines exceeds ~3000 line budget "
+                f"for Ollama context; review may be incomplete"
+            )
 
         t0 = time.time()
         findings = _review_file(

@@ -50,8 +50,18 @@ def deep_review(project_root: Path, repo_map: RepoMap,
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        logger.error("ANTHROPIC_API_KEY not set")
-        return []
+        # Return sentinel so CLI can distinguish "no additional findings" from
+        # "Claude was never called". Previously both returned [] silently.
+        logger.error("ANTHROPIC_API_KEY not set — Claude deep review SKIPPED")
+        return [{
+            "file": "-",
+            "line": 0,
+            "severity": "high",
+            "category": "tool_failure",
+            "source": "deep_reviewer",
+            "bug_desc": "ANTHROPIC_API_KEY not set; Claude deep review SKIPPED — "
+                        "results are UNKNOWN, not clean",
+        }]
 
     context_parts = []
 
