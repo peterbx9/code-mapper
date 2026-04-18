@@ -81,8 +81,8 @@ def _extract_tables(tree: ast.Module, file_node: Node):
         if isinstance(node, ast.Assign):
             for target in node.targets:
                 if isinstance(target, ast.Name) and target.id == "__tablename__":
-                    if isinstance(node.value, (ast.Constant, ast.Str)):
-                        val = node.value.value if isinstance(node.value, ast.Constant) else node.value.s
+                    if isinstance(node.value, ast.Constant):
+                        val = node.value.value
                         if isinstance(val, str):
                             file_node.tables.append(val)
 
@@ -96,8 +96,8 @@ def _extract_tables(tree: ast.Module, file_node: Node):
 
             if func_name == "relationship":
                 for arg in node.args:
-                    if isinstance(arg, (ast.Constant, ast.Str)):
-                        val = arg.value if isinstance(arg, ast.Constant) else arg.s
+                    if isinstance(arg, ast.Constant):
+                        val = arg.value
                         if isinstance(val, str) and val not in file_node.tables:
                             file_node.tables.append(f"rel:{val}")
 
@@ -119,8 +119,8 @@ def _extract_routes_from_module(tree: ast.Module, file_node: Node, source: str):
             if isinstance(func, ast.Attribute) and func.attr == "include_router":
                 route_info = {"type": "include_router", "line": node.lineno}
                 for kw in node.keywords:
-                    if kw.arg == "prefix" and isinstance(kw.value, (ast.Constant, ast.Str)):
-                        val = kw.value.value if isinstance(kw.value, ast.Constant) else kw.value.s
+                    if kw.arg == "prefix" and isinstance(kw.value, ast.Constant):
+                        val = kw.value.value
                         route_info["prefix"] = val
                     elif kw.arg == "tags":
                         pass
@@ -141,8 +141,8 @@ def _parse_route_decorator(dec) -> Optional[dict]:
 
         if method and dec.args:
             path_arg = dec.args[0]
-            if isinstance(path_arg, (ast.Constant, ast.Str)):
-                path = path_arg.value if isinstance(path_arg, ast.Constant) else path_arg.s
+            if isinstance(path_arg, ast.Constant):
+                path = path_arg.value
                 return {"method": method, "path": str(path)}
     return None
 
@@ -357,14 +357,14 @@ def _is_stub(func_node) -> bool:
         stmt = body[0]
         if isinstance(stmt, ast.Pass):
             return True
-        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, (ast.Constant, ast.Str)):
+        if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant):
             return True
         if isinstance(stmt, ast.Return) and stmt.value is None:
             return True
         if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
             return True
     if len(body) == 2:
-        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, (ast.Constant, ast.Str)):
+        if isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
             if isinstance(body[1], (ast.Pass, ast.Return)):
                 return True
     return False

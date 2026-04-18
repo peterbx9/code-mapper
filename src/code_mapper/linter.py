@@ -2,23 +2,64 @@
 AST-based lint rules for Code Mapper (Tier 1).
 
 Catches intra-file issues that the structural parser misses:
-- Dead imports (imported but never referenced)
+- Dead imports (imported but never referenced) — respects # noqa: F401
 - Unused parameters
 - Unused module-level constants/variables
 - raise NotImplementedError stubs
 - list.pop(0) performance anti-pattern
 - json.loads/json.dumps without try/except
 - Stats/counts before filtering (order-of-operations smell)
+- Broad except that doesn't log/raise/surface the exception
+- Function-scoped import used by another module-level function (NameError risk)
+- Tuple-unpack of a call whose returns don't match the unpack arity
+
+Any finding on a line with `# noqa` or `# noqa: <rule>` comment is suppressed.
 """
 
 import ast
 import logging
+import re
 from pathlib import Path
 from typing import Optional
 
 from .schema import RepoMap, Node, NodeType
 
 logger = logging.getLogger(__name__)
+
+_NOQA_RE = re.compile(r"#\s*noqa(?::\s*([A-Za-z0-9_,\s]+))?", re.IGNORECASE)
+
+
+def _scan_noqa_lines(source: str) -> dict[int, set[str] | None]:
+    """Return {line_number: codes_or_None} for every `# noqa` comment.
+    `None` value means bare `# noqa` (suppresses ALL rules on that line);
+    a set means `# noqa: X,Y` (suppresses only those rule names)."""
+    out: dict[int, set[str] | None] = {}
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        m = _NOQA_RE.search(line)
+        if not m:
+            continue
+        codes = m.group(1)
+        if codes:
+            out[lineno] = {c.strip().upper() for c in codes.split(",") if c.strip()}
+        else:
+            out[lineno] = None
+    return out
+
+
+def _is_suppressed(noqa_lines: dict[int, set[str] | None], line: int, rule: str) -> bool:
+    """True if line carries a noqa comment that suppresses this rule."""
+    codes = noqa_lines.get(line, "__MISS__")
+    if codes == "__MISS__":
+        return False
+    if codes is None:  # bare # noqa
+        return True
+    # flake8/ruff codes like F401 → pass through; also allow raw rule names
+    if rule in codes or any(c in rule for c in codes):
+        return True
+    # Special: F401 is the well-known "imported but unused" code — map to DEAD_IMPORT
+    if rule == "DEAD_IMPORT" and "F401" in codes:
+        return True
+    return False
 
 
 class LintFinding:
@@ -65,19 +106,29 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         except SyntaxError:
             continue
 
-        findings.extend(_check_dead_imports(tree, rel))
-        findings.extend(_check_unused_params(tree, rel))
-        findings.extend(_check_unused_constants(tree, rel))
-        findings.extend(_check_notimplemented_stubs(tree, rel))
-        findings.extend(_check_list_pop_zero(tree, rel))
-        findings.extend(_check_unguarded_json(tree, rel))
-        findings.extend(_check_unused_argparse_args(tree, rel))
-        findings.extend(_check_self_assign_in_except(tree, rel))
-        findings.extend(_check_swallowed_exceptions(tree, rel))
-        findings.extend(_check_unguarded_file_open(tree, rel))
-        findings.extend(_check_magic_numbers(tree, rel))
-        findings.extend(_check_god_objects(tree, rel, len(source.splitlines())))
-        findings.extend(_check_unreachable_code(tree, rel))
+        noqa_lines = _scan_noqa_lines(source)
+
+        file_findings = []
+        file_findings.extend(_check_dead_imports(tree, rel))
+        file_findings.extend(_check_unused_params(tree, rel))
+        file_findings.extend(_check_unused_constants(tree, rel))
+        file_findings.extend(_check_notimplemented_stubs(tree, rel))
+        file_findings.extend(_check_list_pop_zero(tree, rel))
+        file_findings.extend(_check_unguarded_json(tree, rel))
+        file_findings.extend(_check_unused_argparse_args(tree, rel))
+        file_findings.extend(_check_self_assign_in_except(tree, rel))
+        file_findings.extend(_check_swallowed_exceptions(tree, rel))
+        file_findings.extend(_check_unguarded_file_open(tree, rel))
+        file_findings.extend(_check_magic_numbers(tree, rel))
+        file_findings.extend(_check_god_objects(tree, rel, len(source.splitlines())))
+        file_findings.extend(_check_unreachable_code(tree, rel))
+        file_findings.extend(_check_function_scoped_import_leak(tree, rel))
+        file_findings.extend(_check_unpack_size_mismatch(tree, rel))
+
+        # Drop findings suppressed by `# noqa` comments on their line
+        for f in file_findings:
+            if not _is_suppressed(noqa_lines, f.line, f.rule):
+                findings.append(f)
 
     return findings
 
@@ -199,7 +250,7 @@ def _check_notimplemented_stubs(tree: ast.Module, file_path: str) -> list[LintFi
         body = node.body
         effective_body = body
         if (len(body) >= 1 and isinstance(body[0], ast.Expr)
-                and isinstance(getattr(body[0], 'value', None), (ast.Constant, ast.Str))):
+                and isinstance(getattr(body[0], 'value', None), ast.Constant)):
             effective_body = body[1:]
 
         if len(effective_body) == 1:
@@ -278,8 +329,8 @@ def _check_unused_argparse_args(tree: ast.Module, file_path: str) -> list[LintFi
 
         dest_name = None
         for arg in node.args:
-            if isinstance(arg, (ast.Constant, ast.Str)):
-                val = arg.value if isinstance(arg, ast.Constant) else arg.s
+            if isinstance(arg, ast.Constant):
+                val = arg.value
                 if isinstance(val, str) and val.startswith("--"):
                     dest_name = val.lstrip("-").replace("-", "_")
                     break
@@ -442,7 +493,13 @@ def _check_self_assign_in_except(tree: ast.Module, file_path: str) -> list[LintF
 
 
 def _check_swallowed_exceptions(tree: ast.Module, file_path: str) -> list[LintFinding]:
-    """Detect except blocks that catch broadly and don't log/raise/re-raise."""
+    """Detect except blocks that catch broadly and don't log/raise/re-raise.
+
+    Also recognizes 'surfaces the exception' via:
+      - return statement that references the caught exception variable
+      - append/extend call that references the exception variable
+      - assignment to result dict/state that references the exception variable
+    These patterns propagate the error to the caller even without logging."""
     findings = []
 
     LOGGING_CALLS = {"log", "logger", "logging", "print", "traceback", "warn", "warning", "error", "critical"}
@@ -456,8 +513,11 @@ def _check_swallowed_exceptions(tree: ast.Module, file_path: str) -> list[LintFi
         if not is_broad:
             continue
 
+        exc_name = node.name  # the `as e` variable, or None
+
         has_raise = False
         has_log = False
+        surfaces_exception = False
         for child in ast.walk(node):
             if isinstance(child, ast.Raise):
                 has_raise = True
@@ -473,7 +533,15 @@ def _check_swallowed_exceptions(tree: ast.Module, file_path: str) -> list[LintFi
                 if any(log_name in name.lower() for log_name in LOGGING_CALLS):
                     has_log = True
 
-        if not has_raise and not has_log:
+            # If the except body references the caught exception var in a return,
+            # append(), extend(), or dict assignment — it's being surfaced up.
+            if exc_name and isinstance(child, (ast.Return, ast.Call, ast.Assign)):
+                for sub in ast.walk(child):
+                    if isinstance(sub, ast.Name) and sub.id == exc_name:
+                        surfaces_exception = True
+                        break
+
+        if not has_raise and not has_log and not surfaces_exception:
             body_stmts = [s for s in node.body if not isinstance(s, ast.Pass)]
             if len(body_stmts) <= 1:
                 findings.append(LintFinding(
@@ -573,3 +641,255 @@ def _build_try_scope(tree: ast.Module) -> dict:
 
     _walk(tree)
     return tags
+
+
+def _collect_function_local_imports(tree: ast.Module) -> dict[str, tuple[set[str], int]]:
+    """For every module-level function, return {func_name: (imported_names, lineno)}.
+    Only tracks imports inside the function body (not module-level)."""
+    out: dict[str, tuple[set[str], int]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        names = set()
+        for sub in ast.walk(node):
+            if sub is node:
+                continue
+            if isinstance(sub, ast.Import):
+                for alias in sub.names:
+                    names.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(sub, ast.ImportFrom):
+                for alias in sub.names:
+                    if alias.name != "*":
+                        names.add(alias.asname or alias.name)
+        if names:
+            out[node.name] = (names, node.lineno)
+    return out
+
+
+def _collect_module_scope_names(tree: ast.Module) -> set[str]:
+    """Names defined/assigned at module scope (imports, defs, classes, assignments)."""
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+    return names
+
+
+def _collect_local_names(func_node) -> set[str]:
+    """Names defined locally within a function: parameters + assignments + local imports."""
+    names = set()
+    # params
+    args = func_node.args
+    for a in args.args + args.kwonlyargs + args.posonlyargs:
+        names.add(a.arg)
+    if args.vararg:
+        names.add(args.vararg.arg)
+    if args.kwarg:
+        names.add(args.kwarg.arg)
+    # assignments, imports, nested defs
+    for sub in ast.walk(func_node):
+        if sub is func_node:
+            continue
+        if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+            targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+                elif isinstance(t, ast.Tuple):
+                    for elt in t.elts:
+                        if isinstance(elt, ast.Name):
+                            names.add(elt.id)
+        elif isinstance(sub, ast.Import):
+            for alias in sub.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(sub, ast.ImportFrom):
+            for alias in sub.names:
+                if alias.name != "*":
+                    names.add(alias.asname or alias.name)
+        elif isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(sub.name)
+        elif isinstance(sub, (ast.For, ast.AsyncFor)):
+            if isinstance(sub.target, ast.Name):
+                names.add(sub.target.id)
+        elif isinstance(sub, ast.comprehension):
+            if isinstance(sub.target, ast.Name):
+                names.add(sub.target.id)
+        elif isinstance(sub, ast.ExceptHandler) and sub.name:
+            names.add(sub.name)
+        elif isinstance(sub, ast.With) and sub.items:
+            for item in sub.items:
+                if item.optional_vars and isinstance(item.optional_vars, ast.Name):
+                    names.add(item.optional_vars.arg if hasattr(item.optional_vars, "arg") else item.optional_vars.id)
+    return names
+
+
+_PY_BUILTINS = set(dir(__builtins__)) if hasattr(__builtins__, '__iter__') else set()
+# Fallback builtin list (works under `python -m`)
+_PY_BUILTINS = _PY_BUILTINS | {
+    "abs", "all", "any", "ascii", "bin", "bool", "bytearray", "bytes", "callable",
+    "chr", "classmethod", "compile", "complex", "delattr", "dict", "dir", "divmod",
+    "enumerate", "eval", "exec", "exit", "filter", "float", "format", "frozenset",
+    "getattr", "globals", "hasattr", "hash", "help", "hex", "id", "input", "int",
+    "isinstance", "issubclass", "iter", "len", "list", "locals", "map", "max",
+    "memoryview", "min", "next", "object", "oct", "open", "ord", "pow", "print",
+    "property", "range", "repr", "reversed", "round", "set", "setattr", "slice",
+    "sorted", "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
+    "True", "False", "None", "NotImplemented", "Ellipsis",
+    "Exception", "BaseException", "ValueError", "TypeError", "KeyError", "IndexError",
+    "RuntimeError", "StopIteration", "OSError", "FileNotFoundError", "PermissionError",
+    "AttributeError", "ImportError", "ModuleNotFoundError", "NameError", "ZeroDivisionError",
+    "ArithmeticError", "LookupError", "NotImplementedError", "AssertionError",
+    "__name__", "__file__", "__doc__", "__builtins__", "__import__", "__loader__",
+    "__spec__", "__package__",
+}
+
+
+def _check_function_scoped_import_leak(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """NameError risk: function A imports X locally, function B (not nested in A)
+    references X. At runtime, B's scope resolution never sees A's local binding.
+
+    Caught the FRed morning_scan disaster — `import json` inside main() used by
+    _save_plays helper → NameError on every scheduled run.
+    """
+    findings = []
+
+    func_imports = _collect_function_local_imports(tree)  # {fn_name: (names, lineno)}
+    module_names = _collect_module_scope_names(tree)
+
+    # For each module-level function, check if it references a name that is
+    # imported only inside a DIFFERENT function.
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        caller_name = node.name
+        local_names = _collect_local_names(node)
+
+        # Build set of names imported inside OTHER functions at module level
+        other_func_imports: dict[str, str] = {}  # name → origin_function
+        for other_fn, (names, _ln) in func_imports.items():
+            if other_fn == caller_name:
+                continue
+            for n in names:
+                other_func_imports.setdefault(n, other_fn)
+
+        if not other_func_imports:
+            continue
+
+        # Walk caller body for Name references
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Name):
+                continue
+            if not isinstance(sub.ctx, ast.Load):
+                continue
+            nm = sub.id
+            if nm in local_names or nm in module_names or nm in _PY_BUILTINS:
+                continue
+            if nm in other_func_imports:
+                origin = other_func_imports[nm]
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=sub.lineno,
+                    rule="FUNCTION_SCOPED_IMPORT_LEAK",
+                    severity="high",
+                    desc=(f"'{nm}' used here but imported only inside function "
+                          f"'{origin}()' — will raise NameError at runtime "
+                          f"(move the import to module scope)"),
+                ))
+                break  # one finding per caller is enough
+
+    return findings
+
+
+def _return_tuple_sizes(func_node) -> set:
+    """Return set of tuple-arities from `return X, Y, ...` statements.
+    -1 means 'returns a scalar or unknown'. Skips bare `return` (implicit None)."""
+    sizes = set()
+    for sub in ast.walk(func_node):
+        if sub is func_node:
+            continue
+        # Don't look inside nested functions
+        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)) and sub is not func_node:
+            continue
+        if isinstance(sub, ast.Return):
+            if sub.value is None:
+                sizes.add(1)  # implicit None
+            elif isinstance(sub.value, ast.Tuple):
+                sizes.add(len(sub.value.elts))
+            else:
+                sizes.add(1)
+    return sizes
+
+
+def _check_unpack_size_mismatch(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """When `a, b = func()` in the same file where func's returns are clearly N-tuples
+    and N != unpack arity, flag. Catches refactor drift where a function's return
+    shape changed but a caller still expects the old shape.
+
+    Caught FRed's _index_premarket_check → returned bool alone, caller unpacked
+    `market_hold, index_data = ...` → NameError (or TypeError on unpack)."""
+    findings = []
+
+    # Collect module-level function return-arities
+    fn_arities: dict[str, set] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn_arities[node.name] = _return_tuple_sizes(node)
+
+    if not fn_arities:
+        return findings
+
+    for node in ast.walk(tree):
+        # `a, b = func()` is an Assign with target = Tuple
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Tuple):
+            continue
+        # Skip star-unpacking (`a, *rest = ...`) — consumer is flexible
+        if any(isinstance(e, ast.Starred) for e in target.elts):
+            continue
+        n_expected = len(target.elts)
+
+        # Is the RHS a simple function call to a known function?
+        if not isinstance(node.value, ast.Call):
+            continue
+        callee = node.value.func
+        if isinstance(callee, ast.Name):
+            fn_name = callee.id
+        elif isinstance(callee, ast.Attribute):
+            fn_name = callee.attr
+        else:
+            continue
+
+        if fn_name not in fn_arities:
+            continue
+        arities = fn_arities[fn_name]
+        if not arities:
+            continue
+        if n_expected not in arities:
+            # Mismatch — expected unpack size not in any return path
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=node.lineno,
+                rule="UNPACK_SIZE_MISMATCH",
+                severity="high",
+                desc=(f"unpacking {n_expected} values from '{fn_name}()' but its "
+                      f"return statements produce tuple arities {sorted(arities)} "
+                      f"— runtime TypeError or NameError waiting to happen"),
+            ))
+
+    return findings
