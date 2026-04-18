@@ -581,43 +581,83 @@ def _questions_from_doc_vs_code(project_root: Path, repo_map: RepoMap,
 
 
 def _ask_question(q: TargetedQuestion, model: str, url: str) -> Optional[dict]:
+    """Ask one yes/no question. Retries once on timeout / 5xx. Bumps timeout
+    for large models (32B variants). Logs specific errors at warning so the
+    user learns WHY a question failed (not just that it did)."""
+    # Truncate at a line boundary, not mid-token, so the model doesn't see
+    # a half-statement and answer "no" because an effect got cut off.
+    snippet = q.code_snippet[:3000]
+    if len(q.code_snippet) > 3000:
+        last_nl = snippet.rfind("\n")
+        if last_nl > 0:
+            snippet = snippet[:last_nl] + "\n# [truncated]"
+
     prompt = QUESTION_PROMPT.format(
         question=q.question,
         file_path=q.file_path,
         start_line=q.start_line,
         end_line=q.end_line,
-        code_snippet=q.code_snippet[:3000],
+        code_snippet=snippet,
     )
 
-    try:
-        resp = httpx.post(
-            f"{url}/api/generate",
-            json={
-                "model": model,
-                "prompt": prompt,
-                "stream": False,
-                "options": {
-                    "temperature": 0.0,
-                    "num_predict": 256,
+    # Heuristic: 32B and larger models need more warmup + generation time.
+    is_large = any(sz in model.lower() for sz in ("32b", "70b", "72b"))
+    timeout = 180 if is_large else 90
+
+    for attempt in (1, 2):
+        try:
+            resp = httpx.post(
+                f"{url}/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.0, "num_predict": 256},
                 },
-            },
-            timeout=30,
-        )
-        if resp.status_code != 200:
+                timeout=timeout,
+            )
+            if resp.status_code == 404:
+                # Model not installed — retrying won't help.
+                logger.warning(
+                    f"Ollama 404 for model {model!r}: {resp.text[:200]} "
+                    f"(run `ollama pull {model}`)"
+                )
+                return None
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Ollama {resp.status_code} on attempt {attempt}: "
+                    f"{resp.text[:200]}"
+                )
+                if attempt == 2:
+                    return None
+                continue
+
+            response = resp.json().get("response", "").strip()
+            json_start = response.find("{")
+            json_end = response.rfind("}") + 1
+            if json_start == -1 or json_end <= json_start:
+                logger.warning(f"No JSON in Ollama response: {response[:200]!r}")
+                return None
+            return json.loads(response[json_start:json_end])
+
+        except httpx.TimeoutException:
+            logger.warning(
+                f"Ollama timeout after {timeout}s on attempt {attempt} "
+                f"(model={model}, question={q.file_path}:{q.start_line})"
+            )
+            if attempt == 2:
+                return None
+        except httpx.NetworkError as e:
+            logger.warning(f"Ollama network error: {e}")
+            if attempt == 2:
+                return None
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Bad JSON from Ollama: {e}")
+            return None  # don't retry parse errors
+        except Exception as e:
+            logger.warning(f"Unexpected Ollama failure: {type(e).__name__}: {e}")
             return None
-
-        response = resp.json().get("response", "").strip()
-
-        json_start = response.find("{")
-        json_end = response.rfind("}") + 1
-        if json_start == -1 or json_end <= json_start:
-            return None
-
-        return json.loads(response[json_start:json_end])
-
-    except Exception as e:
-        logger.debug(f"Question failed: {e}")
-        return None
+    return None
 
 
 def _check_ollama(url: str) -> bool:

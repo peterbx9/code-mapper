@@ -96,40 +96,47 @@ def assemble_map(project_root: Path, config: Optional[dict] = None) -> RepoMap:
 
 
 def _find_python_files(root: Path, exclude_dirs: set) -> list[Path]:
+    """Walk the project collecting .py files. Skips excluded dirs, gitignored
+    paths, and *-OFF.py mothballed files. Uses os.walk with followlinks=False
+    to prevent infinite loops on recursive symlinks — previously used
+    Path.rglob which follows symlinks by default and could hang on projects
+    with `./venv -> /some/shared/venv` style setups."""
+    import os as _os
     py_files = []
 
     gitignore_patterns = _load_gitignore(root)
+    root_resolved = root.resolve()
 
-    for path in root.rglob("*.py"):
-        rel = path.relative_to(root)
-        parts = rel.parts
+    for dirpath, dirnames, filenames in _os.walk(root, followlinks=False):
+        # Prune excluded dirs in-place so os.walk doesn't descend into them.
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in exclude_dirs
+            and not any(d == e.rstrip("/") for e in exclude_dirs if e.endswith("/"))
+        ]
 
-        skip = False
-        for part in parts[:-1]:
-            if part in exclude_dirs:
-                skip = True
-                break
-            for excl in exclude_dirs:
-                if excl.endswith("/") and part == excl.rstrip("/"):
-                    skip = True
-                    break
-            if skip:
-                break
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            if fname.endswith("-OFF.py"):
+                continue
 
-        if skip:
-            continue
+            path = Path(dirpath) / fname
+            try:
+                rel = path.relative_to(root_resolved)
+            except ValueError:
+                try:
+                    rel = path.relative_to(root)
+                except ValueError:
+                    continue
 
-        rel_str = str(rel).replace("\\", "/")
-        if any(rel_str.startswith(p.rstrip("/")) for p in exclude_dirs if "/" in p):
-            continue
+            rel_str = str(rel).replace("\\", "/")
+            if any(rel_str.startswith(p.rstrip("/")) for p in exclude_dirs if "/" in p):
+                continue
+            if _matches_gitignore(rel_str, gitignore_patterns):
+                continue
 
-        if _matches_gitignore(rel_str, gitignore_patterns):
-            continue
-
-        if path.name.endswith("-OFF.py"):
-            continue
-
-        py_files.append(path)
+            py_files.append(path)
 
     return sorted(py_files)
 

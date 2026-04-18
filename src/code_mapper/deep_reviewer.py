@@ -5,7 +5,9 @@ Sends repo-map + all prior findings + source of flagged files to Claude.
 Single synthesis pass for bugs that require cross-file reasoning,
 doc-vs-code comparison, and architectural judgment.
 
-Uses prompt caching for the repo-map context.
+NOTE: prompt caching is NOT currently implemented — every call pays the
+full token cost for the repo-map context. See cli.py --dry-run idea and
+Anthropic docs on cache_control for how to add this cheaply.
 """
 
 import json
