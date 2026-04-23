@@ -147,6 +147,11 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_compare_to_bool_with_eq(tree, rel))
         file_findings.extend(_check_bare_except(tree, rel))
         file_findings.extend(_check_raise_without_from(tree, rel))
+        file_findings.extend(_check_return_break_in_finally(tree, rel))
+        file_findings.extend(_check_datetime_now_no_tz(tree, rel))
+        file_findings.extend(_check_mutate_loop_iterable(tree, rel))
+        file_findings.extend(_check_open_without_encoding(tree, rel))
+        file_findings.extend(_check_subprocess_no_returncode_check(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -1458,4 +1463,225 @@ def _check_raise_without_from(tree: ast.Module, file_path: str) -> list[LintFind
             severity="med",
             desc="raise inside except without 'from err' / 'from None' — loses original traceback",
         ))
+    return findings
+
+
+def _check_return_break_in_finally(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag return/break/continue inside finally: that would exit the finally block and
+    silently swallow any active exception. Respects nested function and nested-loop scopes."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        for stmt in node.finalbody:
+            _scan_finally_body(stmt, file_path, findings, in_loop=False, in_func=False)
+    return findings
+
+
+def _scan_finally_body(node, file_path, findings, in_loop, in_func):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+        return
+    if isinstance(node, ast.Return) and not in_func:
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="RETURN_BREAK_IN_FINALLY", severity="med",
+            desc="'return' inside finally: silently swallows any active exception",
+        ))
+    elif isinstance(node, (ast.Break, ast.Continue)) and not in_loop and not in_func:
+        kind = type(node).__name__.lower()
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="RETURN_BREAK_IN_FINALLY", severity="med",
+            desc=f"'{kind}' inside finally: silently swallows any active exception",
+        ))
+    next_in_loop = in_loop or isinstance(node, (ast.For, ast.While, ast.AsyncFor))
+    for child in ast.iter_child_nodes(node):
+        _scan_finally_body(child, file_path, findings, next_in_loop, in_func)
+
+
+def _check_datetime_now_no_tz(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag datetime.now() / datetime.utcnow() / datetime.fromtimestamp() without tz.
+    Accepts tz passed positionally OR as tz=/tzinfo= kwarg. utcnow() is always flagged
+    (deprecated in 3.12, always naive)."""
+    findings = []
+    # now: tz at position 0; fromtimestamp: tz at position 1; utcnow: no tz arg at all.
+    POSITIONAL_TZ_INDEX = {"now": 0, "fromtimestamp": 1}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute):
+            continue
+        method = func.attr
+        if method not in ("now", "utcnow", "fromtimestamp"):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id in ("datetime", "dt")):
+            continue
+        has_tz_kwarg = any(kw.arg in ("tz", "tzinfo") for kw in node.keywords)
+        pos_tz_idx = POSITIONAL_TZ_INDEX.get(method)
+        has_positional_tz = pos_tz_idx is not None and len(node.args) > pos_tz_idx
+        if has_tz_kwarg or has_positional_tz:
+            continue
+        suffix = "deprecated in 3.12, always naive" if method == "utcnow" else "returns naive datetime (TZ bugs on cross-system data)"
+        findings.append(LintFinding(
+            file_path=file_path,
+            line=node.lineno,
+            rule="DATETIME_NOW_NO_TZ",
+            severity="med",
+            desc=f"datetime.{method}() without tz — {suffix}",
+        ))
+    return findings
+
+
+_LOOP_MUTATORS = {"append", "extend", "insert", "remove", "pop", "clear",
+                  "update", "popitem", "setdefault", "__setitem__", "__delitem__"}
+
+
+def _check_mutate_loop_iterable(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag mutations of the loop iterable inside its own for-loop body."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.For):
+            continue
+        iter_name = _loop_iter_name(node.iter)
+        if not iter_name:
+            continue
+        seen = set()
+        for child in ast.walk(node):
+            if child is node:
+                continue
+            line = getattr(child, "lineno", None)
+            if line in seen:
+                continue
+            if isinstance(child, ast.Call):
+                func = child.func
+                if (isinstance(func, ast.Attribute) and func.attr in _LOOP_MUTATORS
+                        and isinstance(func.value, ast.Name) and func.value.id == iter_name):
+                    findings.append(LintFinding(
+                        file_path=file_path, line=line,
+                        rule="MUTATE_LOOP_ITERABLE", severity="med",
+                        desc=f"Mutating '{iter_name}.{func.attr}()' inside its own for-loop — skips items or raises",
+                    ))
+                    seen.add(line)
+            elif isinstance(child, ast.Delete):
+                for target in child.targets:
+                    if (isinstance(target, ast.Subscript)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == iter_name):
+                        findings.append(LintFinding(
+                            file_path=file_path, line=line,
+                            rule="MUTATE_LOOP_ITERABLE", severity="med",
+                            desc=f"'del {iter_name}[...]' inside its own for-loop — skips items or raises",
+                        ))
+                        seen.add(line)
+                        break
+    return findings
+
+
+def _loop_iter_name(iter_node) -> Optional[str]:
+    if isinstance(iter_node, ast.Name):
+        return iter_node.id
+    if isinstance(iter_node, ast.Call) and isinstance(iter_node.func, ast.Attribute):
+        if iter_node.func.attr in ("items", "keys", "values"):
+            if isinstance(iter_node.func.value, ast.Name):
+                return iter_node.func.value.id
+    return None
+
+
+_OPEN_MODULE_PREFIXES = {"io", "codecs", "pathlib"}
+
+
+def _check_open_without_encoding(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag open()/io.open()/codecs.open() text-mode calls missing encoding= kwarg.
+    Silently skipped for binary mode ('b' in mode string)."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_open = False
+        if isinstance(func, ast.Name) and func.id == "open":
+            is_open = True
+        elif isinstance(func, ast.Attribute) and func.attr == "open":
+            if isinstance(func.value, ast.Name) and func.value.id in _OPEN_MODULE_PREFIXES:
+                is_open = True
+        if not is_open:
+            continue
+        mode = None
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            mode = node.args[1].value
+        else:
+            for kw in node.keywords:
+                if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                    mode = kw.value.value
+                    break
+        if isinstance(mode, str) and "b" in mode:
+            continue
+        if any(kw.arg == "encoding" for kw in node.keywords):
+            continue
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="OPEN_WITHOUT_ENCODING", severity="low",
+            desc="open() in text mode without encoding= — silent Windows/Linux divergence",
+        ))
+    return findings
+
+
+_SUBPROCESS_FNS = {"run", "Popen", "call"}
+
+
+def _check_subprocess_no_returncode_check(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag subprocess.run/Popen/call where return value is discarded AND check=True is not set,
+    OR the return value is assigned but .returncode/.check_returncode() is never accessed
+    in the enclosing function."""
+    findings = []
+    parents = _build_parent_map(tree)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _SUBPROCESS_FNS):
+            continue
+        if not (isinstance(func.value, ast.Name) and func.value.id == "subprocess"):
+            continue
+        has_check_true = any(
+            kw.arg == "check" and isinstance(kw.value, ast.Constant) and kw.value.value is True
+            for kw in node.keywords
+        )
+        if has_check_true:
+            continue
+        parent = parents.get(id(node))
+        target_name = None
+        is_discarded = False
+        if isinstance(parent, ast.Expr):
+            is_discarded = True
+        elif isinstance(parent, ast.Assign) and len(parent.targets) == 1 and isinstance(parent.targets[0], ast.Name):
+            target_name = parent.targets[0].id
+        else:
+            continue
+        if is_discarded:
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="SUBPROCESS_NO_RETURNCODE_CHECK", severity="high",
+                desc=f"subprocess.{func.attr}() return value discarded — child exit status ignored; pass check=True or inspect .returncode",
+            ))
+            continue
+        enclosing = parent
+        while enclosing is not None and not isinstance(enclosing, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            enclosing = parents.get(id(enclosing))
+        if enclosing is None:
+            continue
+        referenced = False
+        for sub in ast.walk(enclosing):
+            if isinstance(sub, ast.Attribute) and sub.attr in ("returncode", "check_returncode"):
+                if isinstance(sub.value, ast.Name) and sub.value.id == target_name:
+                    referenced = True
+                    break
+        if not referenced:
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="SUBPROCESS_NO_RETURNCODE_CHECK", severity="high",
+                desc=f"subprocess.{func.attr}() assigned to '{target_name}' but '.returncode' / '.check_returncode()' never accessed",
+            ))
     return findings
