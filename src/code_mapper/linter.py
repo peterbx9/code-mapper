@@ -613,12 +613,83 @@ def _check_type_mismatch_heuristics(tree: ast.Module, file_path: str) -> list[Li
     return findings
 
 
+_FRAMEWORK_BASE_CLASSES = {
+    "Base", "DeclarativeBase", "BaseModel", "Model",
+    "Middleware", "BaseHTTPMiddleware",
+    "Exception", "BaseException", "Error", "Warning",
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag",
+    "TypedDict", "NamedTuple", "Protocol", "Generic",
+    "TestCase", "IsolatedAsyncioTestCase",
+    "HTMLParser",
+}
+
+
+def _has_framework_base(class_node: ast.ClassDef) -> bool:
+    """Return True if class inherits from a framework base that requires class-form."""
+    for base in class_node.bases:
+        name = None
+        if isinstance(base, ast.Name):
+            name = base.id
+        elif isinstance(base, ast.Attribute):
+            name = base.attr
+        if name and (name in _FRAMEWORK_BASE_CLASSES
+                     or name.endswith("Base") or name.endswith("Middleware")
+                     or name.endswith("Error") or name.endswith("Exception")):
+            return True
+    return False
+
+
+def _is_orm_model(class_node: ast.ClassDef) -> bool:
+    """Heuristic: class with __tablename__ or Column() at class-body level."""
+    for stmt in class_node.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == "__tablename__":
+                    return True
+            if isinstance(stmt.value, ast.Call):
+                func = stmt.value.func
+                fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if fname in ("Column", "mapped_column", "relationship"):
+                    return True
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.value, ast.Call):
+            func = stmt.value.func
+            fname = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if fname in ("Column", "mapped_column", "relationship"):
+                return True
+    return False
+
+
+_DATA_DECORATORS = {"dataclass", "attrs", "define", "frozen", "attr.s"}
+
+
+def _is_data_class(class_node: ast.ClassDef) -> bool:
+    for dec in class_node.decorator_list:
+        name = None
+        if isinstance(dec, ast.Name):
+            name = dec.id
+        elif isinstance(dec, ast.Attribute):
+            name = dec.attr
+        elif isinstance(dec, ast.Call):
+            if isinstance(dec.func, ast.Name):
+                name = dec.func.id
+            elif isinstance(dec.func, ast.Attribute):
+                name = dec.func.attr
+        if name in _DATA_DECORATORS:
+            return True
+    return False
+
+
 def _check_redundant_abstractions(tree: ast.Module, file_path: str) -> list[LintFinding]:
-    """Detect classes with only 1 public method (should be a function)."""
+    """Detect classes with only 1 public method (should be a function).
+    Skips framework-required class forms: ORM models, middleware, exceptions, enums, protocols,
+    and @dataclass / @attrs classes (which exist for auto-generated __init__/__repr__/__eq__)."""
     findings = []
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.ClassDef):
+            continue
+
+        if _has_framework_base(node) or _is_orm_model(node) or _is_data_class(node):
             continue
 
         methods = [n for n in node.body
