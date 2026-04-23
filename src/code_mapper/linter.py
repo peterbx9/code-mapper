@@ -160,6 +160,7 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_fn_in_loop_late_binding(tree, rel))
         file_findings.extend(_check_sync_orm_in_async_endpoint(tree, rel))
         file_findings.extend(_check_string_concat_in_loop(tree, rel))
+        file_findings.extend(_check_division_no_zero_guard(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -2029,6 +2030,177 @@ def _check_string_concat_in_loop(tree: ast.Module, file_path: str) -> list[LintF
             file_path=file_path, line=node.lineno,
             rule="STRING_CONCAT_IN_LOOP", severity="low",
             desc=f"'{node.target.id} += ...' inside a loop where '{node.target.id}' is str — O(n²); use list.append() + ''.join() instead",
+        ))
+    return findings
+
+
+_RISKY_DENOM_NAME = re.compile(
+    r"(?:^|_)(capital|total|count|conf|confidence|budget|balance|weight|size|sum|tot)s?(?:$|_)",
+    re.IGNORECASE,
+)
+
+
+def _denom_desc(node) -> Optional[str]:
+    """Return a description string if this denominator is 'risky' (crash on zero)."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("len", "sum"):
+        inner = node.args[0] if node.args else None
+        if isinstance(inner, ast.Name):
+            return f"{node.func.id}({inner.id})"
+        if isinstance(inner, ast.Attribute):
+            return f"{node.func.id}({_attr_name(inner)})"
+        return f"{node.func.id}(...)"
+    if isinstance(node, ast.Name) and _RISKY_DENOM_NAME.search(node.id):
+        return node.id
+    if isinstance(node, ast.Attribute) and _RISKY_DENOM_NAME.search(node.attr):
+        return _attr_name(node)
+    return None
+
+
+def _attr_name(node) -> str:
+    parts = [node.attr]
+    cur = node.value
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+    return ".".join(reversed(parts))
+
+
+def _denom_key(node) -> Optional[str]:
+    """Logical name for the denom, used for matching against guarded_names set."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return _attr_name(node)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("len", "sum"):
+        inner = node.args[0] if node.args else None
+        if isinstance(inner, ast.Name):
+            return f"{node.func.id}({inner.id})"
+        if isinstance(inner, ast.Attribute):
+            return f"{node.func.id}({_attr_name(inner)})"
+    return None
+
+
+def _guards_from_test(test, guarded: set):
+    """Loosely extract names that a truthy-test expression vouches for as non-zero/non-empty.
+    Handles: `if X:`, `if X > 0`, `if X != 0`, `if len(X)`, `if len(X) > 0`, and AND-chains."""
+    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.And):
+        for v in test.values:
+            _guards_from_test(v, guarded)
+        return
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        # `if not X:` commonly pairs with an early-return (guard-clause). Record X either way —
+        # this is an approximation that errs toward fewer FPs at the cost of a few false-negatives.
+        _guards_from_test(test.operand, guarded)
+        return
+    if isinstance(test, ast.Name):
+        guarded.add(test.id)
+        return
+    if isinstance(test, ast.Attribute):
+        guarded.add(_attr_name(test))
+        guarded.add(test.attr)
+        return
+    if isinstance(test, ast.Call) and isinstance(test.func, ast.Name) and test.func.id == "len":
+        inner = test.args[0] if test.args else None
+        if isinstance(inner, ast.Name):
+            guarded.add(f"len({inner.id})")
+            guarded.add(inner.id)
+        elif isinstance(inner, ast.Attribute):
+            guarded.add(f"len({_attr_name(inner)})")
+        return
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        left = test.left
+        right = test.comparators[0]
+        # `X op 0` or `0 op X`
+        for a, b in ((left, right), (right, left)):
+            if isinstance(b, ast.Constant) and b.value == 0:
+                key = _denom_key(a)
+                if key:
+                    guarded.add(key)
+                    if isinstance(a, ast.Attribute):
+                        guarded.add(a.attr)
+        # len(X) on either side
+        for side in (left, right):
+            if isinstance(side, ast.Call) and isinstance(side.func, ast.Name) and side.func.id == "len":
+                inner = side.args[0] if side.args else None
+                if isinstance(inner, ast.Name):
+                    guarded.add(f"len({inner.id})")
+                    guarded.add(inner.id)
+
+
+def _collect_scope_guards(scope) -> set:
+    """Names guarded by if/assert/while tests anywhere in this scope (loose approximation)."""
+    guarded = set()
+    for node in _walk_same_scope(scope) if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)) else ast.walk(scope):
+        if isinstance(node, (ast.If, ast.While, ast.Assert)):
+            _guards_from_test(node.test, guarded)
+    return guarded
+
+
+def _denom_guard_keys(denom) -> set:
+    """All keys that, if guarded, should exempt this denominator.
+    E.g. for len(xs) → {'len(xs)', 'xs'}; for total → {'total'}."""
+    keys = set()
+    primary = _denom_key(denom)
+    if primary:
+        keys.add(primary)
+        keys.add(primary.split(".")[-1])
+    if isinstance(denom, ast.Call) and isinstance(denom.func, ast.Name) and denom.func.id in ("len", "sum"):
+        inner = denom.args[0] if denom.args else None
+        if inner is not None:
+            inner_key = _denom_key(inner)
+            if inner_key:
+                keys.add(inner_key)
+                keys.add(inner_key.split(".")[-1])
+    return keys
+
+
+def _is_inline_ternary_guarded(binop, parents) -> bool:
+    """Is binop the .body of an IfExp whose test guards the denominator?"""
+    parent = parents.get(id(binop))
+    if not isinstance(parent, ast.IfExp) or parent.body is not binop:
+        return False
+    inline_guards = set()
+    _guards_from_test(parent.test, inline_guards)
+    return bool(_denom_guard_keys(binop.right) & inline_guards)
+
+
+def _check_division_no_zero_guard(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag divisions by risky denominators (len/sum of collection, or var named
+    capital/total/count/conf/budget/balance/weight/size/sum/tot*) without a prior
+    zero-guard in the enclosing function. Inline-ternary guards (x / y if y else 0)
+    are skipped. Origin: home-session 2026-04-22 (FRed allocator crash prevention)."""
+    findings = []
+    parents = _build_parent_map(tree)
+    scope_guards = {}
+    for scope in ast.walk(tree):
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            scope_guards[id(scope)] = _collect_scope_guards(scope)
+
+    seen = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.BinOp) or not isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            continue
+        desc = _denom_desc(node.right)
+        if not desc:
+            continue
+        if _is_inline_ternary_guarded(node, parents):
+            continue
+        enclosing = parents.get(id(node))
+        while enclosing is not None and not isinstance(enclosing, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            enclosing = parents.get(id(enclosing))
+        guarded = scope_guards.get(id(enclosing), set()) if enclosing is not None else set()
+        if _denom_guard_keys(node.right) & guarded:
+            continue
+        dedup = (node.lineno, desc)
+        if dedup in seen:
+            continue
+        seen.add(dedup)
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="DIVISION_NO_ZERO_GUARD", severity="med",
+            desc=f"division by '{desc}' without prior zero-guard — ZeroDivisionError risk on zero-state input",
         ))
     return findings
 
