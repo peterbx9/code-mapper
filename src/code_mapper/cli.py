@@ -332,6 +332,19 @@ def main():
         _run_cluster(repo_map, config)
     if not args.no_connectivity:
         _run_connectivity(repo_map)
+
+    custom_rules = (config or {}).get("rules", [])
+    if custom_rules:
+        from .pattern_rules import run_pattern_rules
+        from .assembler import DEFAULT_EXCLUDE
+        exclude = set(config.get("exclude", [])) | DEFAULT_EXCLUDE if config else DEFAULT_EXCLUDE
+        pattern_findings = run_pattern_rules(project_root, custom_rules, exclude_dirs=exclude)
+        if pattern_findings:
+            print(f"  PATTERN RULES ({len(pattern_findings)}):")
+            for f in pattern_findings:
+                print(f"    [{f.severity}] {f.file_path}:{f.line} {f.rule}: {f.desc}")
+            repo_map.stats["pattern_findings"] = [f.to_dict() for f in pattern_findings]
+
     if args.lint:
         _run_lint(project_root, repo_map, config)
     if args.xref:

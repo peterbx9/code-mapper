@@ -106,17 +106,26 @@ def analyze_connectivity(repo_map: RepoMap):
         if not in_reachable and not has_inbound and node.id not in entry_ids:
             if node.id in standalone_scripts:
                 node.connectivity = ConnectivityStatus.REACHABLE
+                node.dead_confidence = 0
             else:
                 node.connectivity = ConnectivityStatus.UNREACHABLE
+                node.dead_confidence = 100
                 unreachable.append(node.id)
+        elif not in_reachable and has_inbound:
+            node.connectivity = ConnectivityStatus.UNREACHABLE
+            node.dead_confidence = 80
+            unreachable.append(node.id)
         elif in_reachable and not in_effect and node.id not in effect_nodes:
             if node.id in schema_files or node.id in config_files or node.id in middleware_files:
                 node.connectivity = ConnectivityStatus.REACHABLE
+                node.dead_confidence = 0
             else:
                 node.connectivity = ConnectivityStatus.INCOMPLETE
+                node.dead_confidence = 40
                 incomplete.append(node.id)
         else:
             node.connectivity = ConnectivityStatus.REACHABLE
+            node.dead_confidence = 0
 
     if unreachable:
         logger.info(f"Unreachable files: {len(unreachable)}")

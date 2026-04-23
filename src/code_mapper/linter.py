@@ -136,6 +136,10 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_unreachable_code(tree, rel))
         file_findings.extend(_check_function_scoped_import_leak(tree, rel))
         file_findings.extend(_check_unpack_size_mismatch(tree, rel))
+        file_findings.extend(_check_unsatisfiable_conditions(tree, rel))
+        file_findings.extend(_check_type_mismatch_heuristics(tree, rel))
+        file_findings.extend(_check_redundant_abstractions(tree, rel))
+        file_findings.extend(_check_taint_risks(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -522,6 +526,174 @@ def _check_body_for_unreachable(body: list, file_path: str,
                 desc=f"Code after {type(stmt).__name__.lower()} statement is unreachable",
             ))
             break
+
+
+def _check_unsatisfiable_conditions(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect if False:, while False:, if 0:, while 0: dead branches."""
+    findings = []
+    _FALSY = {False, 0, None, ""}
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.If, ast.While)):
+            test = node.test
+            if isinstance(test, ast.Constant) and test.value in _FALSY:
+                kind = "if" if isinstance(node, ast.If) else "while"
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="UNSATISFIABLE_CONDITION",
+                    severity="high",
+                    desc=f"'{kind} {repr(test.value)}:' — condition is always false, body is dead code",
+                ))
+            elif isinstance(test, ast.NameConstant) and test.value in _FALSY:
+                kind = "if" if isinstance(node, ast.If) else "while"
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="UNSATISFIABLE_CONDITION",
+                    severity="high",
+                    desc=f"'{kind} {repr(test.value)}:' — condition is always false, body is dead code",
+                ))
+
+    return findings
+
+
+def _check_type_mismatch_heuristics(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect likely type mismatches without full type checking."""
+    findings = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        returns = []
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return) and child.value is not None:
+                returns.append(child)
+
+        if len(returns) < 2:
+            continue
+
+        return_types = set()
+        for ret in returns:
+            val = ret.value
+            if val is None or (isinstance(val, ast.Constant) and val.value is None):
+                return_types.add("None")
+            elif isinstance(val, ast.Dict):
+                return_types.add("dict")
+            elif isinstance(val, ast.List):
+                return_types.add("list")
+            elif isinstance(val, (ast.Tuple, ast.Set)):
+                return_types.add(type(val).__name__.lower())
+            elif isinstance(val, ast.Constant):
+                return_types.add(type(val.value).__name__)
+            elif isinstance(val, ast.Call):
+                return_types.add("call")
+            else:
+                return_types.add("expr")
+
+        concrete = return_types - {"call", "expr"}
+        if "None" in concrete and len(concrete) > 1:
+            other = concrete - {"None"}
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=node.lineno,
+                rule="MIXED_RETURN_TYPES",
+                severity="med",
+                desc=f"Function '{node.name}' returns both None and {'/'.join(other)} in different branches — callers may not handle None",
+            ))
+
+    return findings
+
+
+def _check_redundant_abstractions(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Detect classes with only 1 public method (should be a function)."""
+    findings = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        methods = [n for n in node.body
+                   if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        public_methods = [m for m in methods if not m.name.startswith("_") or m.name == "__init__"]
+        non_init = [m for m in public_methods if m.name != "__init__"]
+
+        if len(non_init) == 1 and len(methods) <= 2:
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=node.lineno,
+                rule="REDUNDANT_CLASS",
+                severity="low",
+                desc=f"Class '{node.name}' has only 1 public method '{non_init[0].name}' — consider using a plain function instead",
+            ))
+
+    return findings
+
+
+DANGEROUS_SINKS = {
+    "os.system", "os.popen", "subprocess.call", "subprocess.run",
+    "subprocess.Popen", "subprocess.check_output", "subprocess.check_call",
+    "eval", "exec", "compile",
+}
+
+DANGEROUS_ATTRS = {"system", "popen", "call", "run", "Popen", "check_output", "check_call"}
+
+
+def _check_taint_risks(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Simplified taint tracking: flag dangerous sinks called with non-literal args."""
+    findings = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+
+        func = node.func
+        func_name = None
+
+        if isinstance(func, ast.Name):
+            if func.id in ("eval", "exec", "compile"):
+                func_name = func.id
+        elif isinstance(func, ast.Attribute):
+            if func.attr in DANGEROUS_ATTRS:
+                if isinstance(func.value, ast.Name):
+                    func_name = f"{func.value.id}.{func.attr}"
+                else:
+                    func_name = func.attr
+
+        if not func_name:
+            continue
+
+        if node.args:
+            first_arg = node.args[0]
+            if isinstance(first_arg, ast.Constant):
+                continue
+            if isinstance(first_arg, ast.JoinedStr):
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="TAINT_FSTRING_IN_SINK",
+                    severity="high",
+                    desc=f"f-string passed to {func_name}() — potential command/code injection",
+                ))
+            elif isinstance(first_arg, ast.BinOp) and isinstance(first_arg.op, (ast.Add, ast.Mod)):
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="TAINT_CONCAT_IN_SINK",
+                    severity="high",
+                    desc=f"String concatenation/format passed to {func_name}() — potential injection",
+                ))
+            elif isinstance(first_arg, ast.Name):
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="TAINT_VARIABLE_IN_SINK",
+                    severity="med",
+                    desc=f"Variable '{first_arg.id}' passed to {func_name}() — verify input is sanitized",
+                ))
+
+    return findings
 
 
 def _check_self_assign_in_except(tree: ast.Module, file_path: str) -> list[LintFinding]:

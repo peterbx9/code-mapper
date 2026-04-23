@@ -55,6 +55,7 @@ class Node:
     complexity: int = 0
     is_stub: bool = False
     connectivity: ConnectivityStatus = ConnectivityStatus.REACHABLE
+    dead_confidence: int = 0
 
     def to_dict(self):
         d = asdict(self)

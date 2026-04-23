@@ -105,6 +105,8 @@ def build_xref(project_root: Path, repo_map: RepoMap, exclude_dirs: set = None) 
     xref._repo_map = repo_map
     _detect_cross_file_issues(xref)
     _detect_duplicate_functions(project_root, repo_map, xref)
+    _detect_feature_envy(repo_map, xref)
+    _detect_shotgun_surgery(project_root, repo_map, xref)
 
     return xref
 
@@ -352,6 +354,64 @@ def _find_node_in_repo(xref: XRefTable, sym: SymbolRef):
             if short == sym.name and node.line_start == sym.defined_line:
                 return node
     return None
+
+
+def _detect_feature_envy(repo_map: RepoMap, xref: XRefTable):
+    """Flag functions that reference more symbols from another file than their own."""
+    file_call_counts = defaultdict(lambda: defaultdict(int))
+
+    for edge in repo_map.edges:
+        if edge.type.value != "call":
+            continue
+        source_file = edge.source.replace("file:", "") if edge.source.startswith("file:") else None
+        target_file = edge.target.replace("file:", "") if edge.target.startswith("file:") else None
+        if source_file and target_file and source_file != target_file:
+            file_call_counts[source_file][target_file] += 1
+
+    for source_file, targets in file_call_counts.items():
+        if not targets:
+            continue
+        top_target = max(targets, key=targets.get)
+        external_calls = targets[top_target]
+
+        own_calls = 0
+        for edge in repo_map.edges:
+            if edge.type.value == "call" and edge.source == f"file:{source_file}":
+                t = edge.target.replace("file:", "") if edge.target.startswith("file:") else ""
+                if t == source_file:
+                    own_calls += 1
+
+        if external_calls > 5 and external_calls > own_calls * 2:
+            xref.findings.append({
+                "rule": "XREF_FEATURE_ENVY",
+                "severity": "med",
+                "file": source_file,
+                "line": 1,
+                "desc": f"File calls {external_calls} functions from '{top_target}' vs {own_calls} internal — consider moving logic to '{top_target}'",
+            })
+
+
+def _detect_shotgun_surgery(project_root: Path, repo_map: RepoMap, xref: XRefTable):
+    """Flag symbols that are depended on by many files — changing them requires shotgun surgery."""
+    dependents = defaultdict(set)
+
+    for key, sym in xref.symbols.items():
+        for imp in sym.imported_by:
+            dependents[key].add(imp["file"])
+        for call in sym.called_from:
+            dependents[key].add(call["file"])
+
+    THRESHOLD = 5
+    for key, dep_files in dependents.items():
+        if len(dep_files) >= THRESHOLD:
+            sym = xref.symbols[key]
+            xref.findings.append({
+                "rule": "XREF_SHOTGUN_SURGERY",
+                "severity": "low",
+                "file": sym.defined_in,
+                "line": sym.defined_line,
+                "desc": f"'{sym.name}' is depended on by {len(dep_files)} files — changes here require shotgun surgery across {', '.join(sorted(dep_files)[:3])}{'...' if len(dep_files) > 3 else ''}",
+            })
 
 
 def _detect_duplicate_functions(project_root: Path, repo_map: RepoMap, xref: XRefTable):

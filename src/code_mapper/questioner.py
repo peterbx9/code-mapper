@@ -148,6 +148,8 @@ def _generate_questions(project_root: Path, repo_map: RepoMap,
     questions.extend(_questions_from_loaded_fields(project_root, repo_map))
     questions.extend(_questions_from_temporal_ordering(project_root, repo_map))
     questions.extend(_questions_from_constraint_enforcement(project_root, repo_map))
+    questions.extend(_questions_from_contract_verification(project_root, repo_map, xref_data))
+    questions.extend(_questions_from_error_handling(project_root, repo_map))
     if todo_path:
         questions.extend(_questions_from_doc_vs_code(project_root, repo_map, todo_path))
 
@@ -578,6 +580,125 @@ def _questions_from_doc_vs_code(project_root: Path, repo_map: RepoMap,
         ))
 
     return questions
+
+
+def _questions_from_contract_verification(project_root: Path, repo_map: RepoMap,
+                                           xref_data: dict = None) -> list[TargetedQuestion]:
+    """Generate questions about return type contracts between callers and callees."""
+    questions = []
+    if not xref_data or "symbols" not in xref_data:
+        return questions
+
+    for key, sym in xref_data["symbols"].items():
+        if sym.get("type") != "function":
+            continue
+        callers = sym.get("called_from", [])
+        if len(callers) < 2:
+            continue
+
+        file_path = project_root / sym["defined_in"]
+        if not file_path.exists():
+            continue
+
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(source)
+        except (SyntaxError, OSError):
+            continue
+
+        for ast_node in ast.walk(tree):
+            if not isinstance(ast_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if ast_node.name != sym["name"]:
+                continue
+
+            func_lines = source.splitlines()[ast_node.lineno - 1:(ast_node.end_lineno or ast_node.lineno)]
+            func_source = "\n".join(func_lines)
+
+            returns = [n for n in ast.walk(ast_node) if isinstance(n, ast.Return) and n.value is not None]
+            if len(returns) >= 2:
+                caller_files = [c["file"] for c in callers[:3]]
+                questions.append(TargetedQuestion(
+                    file_path=sym["defined_in"],
+                    question=f"Function '{sym['name']}' has {len(returns)} return statements. Does it always return the same type (e.g., always dict, or always list)? Or can it return different types in different branches (e.g., dict in one branch, None in another)?",
+                    code_snippet=func_source,
+                    start_line=ast_node.lineno,
+                    end_line=ast_node.end_lineno or ast_node.lineno,
+                    source_signal=f"Function called by {len(callers)} files ({', '.join(caller_files)}) — inconsistent return type breaks callers",
+                    bug_if_no=f"'{sym['name']}' returns different types — callers in {', '.join(caller_files)} may not handle all cases",
+                ))
+            break
+
+    return questions
+
+
+def _questions_from_error_handling(project_root: Path, repo_map: RepoMap) -> list[TargetedQuestion]:
+    """Check if functions that raise exceptions have callers that catch them."""
+    questions = []
+
+    raisers = {}
+    for node in repo_map.nodes:
+        if node.type != NodeType.FUNCTION:
+            continue
+        file_path = project_root / node.path
+        if not file_path.exists():
+            continue
+        try:
+            source = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        lines = source.splitlines()
+        func_lines = lines[node.line_start - 1:node.line_end]
+        func_source = "\n".join(func_lines)
+
+        if "raise " in func_source and "HTTPException" not in func_source:
+            short_name = node.name.split(".")[-1]
+            raisers[short_name] = {
+                "path": node.path,
+                "line": node.line_start,
+                "source": func_source,
+            }
+
+    for edge in repo_map.edges:
+        if edge.type.value != "call":
+            continue
+        call_name = edge.target.replace("call:", "").split(".")[-1]
+        if call_name not in raisers:
+            continue
+
+        caller_file = edge.source.replace("file:", "")
+        raiser = raisers[call_name]
+        if caller_file == raiser["path"]:
+            continue
+
+        caller_path = project_root / caller_file
+        if not caller_path.exists():
+            continue
+        try:
+            caller_source = caller_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        if f"try" not in caller_source:
+            continue
+
+        call_line = edge.metadata.get("line", 0)
+        context_start = max(0, call_line - 5)
+        context_end = min(len(caller_source.splitlines()), call_line + 10)
+        context = "\n".join(caller_source.splitlines()[context_start:context_end])
+
+        questions.append(TargetedQuestion(
+            file_path=caller_file,
+            question=f"Function '{call_name}' (from {raiser['path']}) can raise exceptions. At the call site around line {call_line}, is the call wrapped in a try/except that handles the specific exceptions '{call_name}' can throw?",
+            code_snippet=context,
+            start_line=context_start + 1,
+            end_line=context_end,
+            source_signal=f"'{call_name}' raises exceptions but caller in {caller_file} may not catch them",
+            bug_if_no=f"Call to '{call_name}' at {caller_file}:{call_line} is not properly guarded — unhandled exception will propagate",
+        ))
+
+    return questions[:20]
 
 
 def _ask_question(q: TargetedQuestion, model: str, url: str) -> Optional[dict]:
