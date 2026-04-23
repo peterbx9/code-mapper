@@ -140,6 +140,13 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_type_mismatch_heuristics(tree, rel))
         file_findings.extend(_check_redundant_abstractions(tree, rel))
         file_findings.extend(_check_taint_risks(tree, rel))
+        file_findings.extend(_check_mutable_default_arg(tree, rel))
+        file_findings.extend(_check_fn_call_in_default_arg(tree, rel))
+        file_findings.extend(_check_zip_without_strict(tree, rel))
+        file_findings.extend(_check_compare_to_none_with_eq(tree, rel))
+        file_findings.extend(_check_compare_to_bool_with_eq(tree, rel))
+        file_findings.extend(_check_bare_except(tree, rel))
+        file_findings.extend(_check_raise_without_from(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -736,8 +743,8 @@ def _check_swallowed_exceptions(tree: ast.Module, file_path: str) -> list[LintFi
         if not isinstance(node, ast.ExceptHandler):
             continue
 
-        is_broad = (node.type is None or
-                    (isinstance(node.type, ast.Name) and node.type.id in ("Exception", "BaseException")))
+        is_broad = (isinstance(node.type, ast.Name)
+                    and node.type.id in ("Exception", "BaseException"))
         if not is_broad:
             continue
 
@@ -1188,5 +1195,196 @@ def _check_unpack_size_mismatch(tree: ast.Module, file_path: str) -> list[LintFi
                       f"return statements produce tuple arities {sorted(arities)} "
                       f"— runtime TypeError waiting to happen"),
             ))
+    return findings
 
+
+def _build_parent_map(tree: ast.Module) -> dict:
+    parents = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    return parents
+
+
+_EMPTY_CONSTRUCTORS = {"list", "dict", "set"}
+
+
+def _check_mutable_default_arg(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        defaults = list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]
+        for default in defaults:
+            is_mutable = False
+            if isinstance(default, (ast.List, ast.Dict, ast.Set)):
+                is_mutable = True
+            elif (isinstance(default, ast.Call) and isinstance(default.func, ast.Name)
+                    and default.func.id in _EMPTY_CONSTRUCTORS
+                    and not default.args and not default.keywords):
+                is_mutable = True
+            if is_mutable:
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=default.lineno,
+                    rule="MUTABLE_DEFAULT_ARG",
+                    severity="high",
+                    desc=f"Mutable default argument in '{node.name}()' — shared across all calls (classic Python foot-gun)",
+                ))
+    return findings
+
+
+_FRAMEWORK_MARKERS = {
+    "Depends", "Query", "Path", "Body", "Header", "Cookie", "File", "Form",
+    "Security", "Param", "Field", "Provide",
+}
+
+
+def _check_fn_call_in_default_arg(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag func calls in default args (eval'd once at def time). Skip empty list/dict/set (MUTABLE_DEFAULT_ARG)
+    and framework markers like FastAPI's Depends/Query/Body (re-evaluated per-request by the framework)."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        defaults = list(node.args.defaults) + [d for d in node.args.kw_defaults if d is not None]
+        for default in defaults:
+            if not isinstance(default, ast.Call):
+                continue
+            if (isinstance(default.func, ast.Name)
+                    and default.func.id in _EMPTY_CONSTRUCTORS
+                    and not default.args and not default.keywords):
+                continue
+            if isinstance(default.func, ast.Name) and default.func.id in _FRAMEWORK_MARKERS:
+                continue
+            if isinstance(default.func, ast.Attribute) and default.func.attr in _FRAMEWORK_MARKERS:
+                continue
+            call_desc = _describe_call(default)
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=default.lineno,
+                rule="FN_CALL_IN_DEFAULT_ARG",
+                severity="med",
+                desc=f"Default argument in '{node.name}()' calls '{call_desc}' — evaluated once at def time, frozen for all calls",
+            ))
+    return findings
+
+
+def _describe_call(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return f"{func.id}()"
+    if isinstance(func, ast.Attribute):
+        base = func.value
+        if isinstance(base, ast.Name):
+            return f"{base.id}.{func.attr}()"
+        return f"<expr>.{func.attr}()"
+    return "<call>"
+
+
+def _check_zip_without_strict(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Name) and func.id == "zip"):
+            continue
+        if len(node.args) < 2:
+            continue
+        has_strict = any(kw.arg == "strict" for kw in node.keywords)
+        if has_strict:
+            continue
+        findings.append(LintFinding(
+            file_path=file_path,
+            line=node.lineno,
+            rule="ZIP_WITHOUT_STRICT",
+            severity="med",
+            desc="zip() without strict= kwarg — silently truncates at shortest iterable",
+        ))
+    return findings
+
+
+def _check_compare_to_none_with_eq(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for op, comparator in zip(node.ops, node.comparators, strict=True):
+            if not isinstance(op, (ast.Eq, ast.NotEq)):
+                continue
+            if isinstance(comparator, ast.Constant) and comparator.value is None:
+                op_sym = "==" if isinstance(op, ast.Eq) else "!="
+                replacement = "is None" if isinstance(op, ast.Eq) else "is not None"
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="COMPARE_TO_NONE_WITH_EQ",
+                    severity="low",
+                    desc=f"'{op_sym} None' — use '{replacement}' (safer against overloaded __eq__)",
+                ))
+    return findings
+
+
+def _check_compare_to_bool_with_eq(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        for op, comparator in zip(node.ops, node.comparators, strict=True):
+            if not isinstance(op, (ast.Eq, ast.NotEq)):
+                continue
+            if isinstance(comparator, ast.Constant) and isinstance(comparator.value, bool):
+                op_sym = "==" if isinstance(op, ast.Eq) else "!="
+                findings.append(LintFinding(
+                    file_path=file_path,
+                    line=node.lineno,
+                    rule="COMPARE_TO_BOOL_WITH_EQ",
+                    severity="low",
+                    desc=f"'{op_sym} {comparator.value}' — use truthy check or 'is'/'is not' (breaks on truthy non-bools)",
+                ))
+    return findings
+
+
+def _check_bare_except(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ExceptHandler):
+            continue
+        if node.type is None:
+            findings.append(LintFinding(
+                file_path=file_path,
+                line=node.lineno,
+                rule="BARE_EXCEPT",
+                severity="high",
+                desc="'except:' with no class — swallows KeyboardInterrupt / SystemExit; use 'except Exception:' instead",
+            ))
+    return findings
+
+
+def _check_raise_without_from(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    findings = []
+    parents = _build_parent_map(tree)
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise):
+            continue
+        if node.exc is None or node.cause is not None:
+            continue
+        current = parents.get(id(node))
+        in_except = False
+        while current is not None:
+            if isinstance(current, ast.ExceptHandler):
+                in_except = True
+                break
+            current = parents.get(id(current))
+        if not in_except:
+            continue
+        findings.append(LintFinding(
+            file_path=file_path,
+            line=node.lineno,
+            rule="RAISE_WITHOUT_FROM",
+            severity="med",
+            desc="raise inside except without 'from err' / 'from None' — loses original traceback",
+        ))
     return findings
