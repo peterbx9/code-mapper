@@ -152,6 +152,14 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_mutate_loop_iterable(tree, rel))
         file_findings.extend(_check_open_without_encoding(tree, rel))
         file_findings.extend(_check_subprocess_no_returncode_check(tree, rel))
+        file_findings.extend(_check_assert_in_non_test(tree, rel))
+        file_findings.extend(_check_sys_exit_in_library(tree, rel))
+        file_findings.extend(_check_f_string_in_logging(tree, rel))
+        file_findings.extend(_check_multi_stmt_pytest_raises(tree, rel))
+        file_findings.extend(_check_blocking_io_in_async(tree, rel))
+        file_findings.extend(_check_fn_in_loop_late_binding(tree, rel))
+        file_findings.extend(_check_sync_orm_in_async_endpoint(tree, rel))
+        file_findings.extend(_check_string_concat_in_loop(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -1685,3 +1693,342 @@ def _check_subprocess_no_returncode_check(tree: ast.Module, file_path: str) -> l
                 desc=f"subprocess.{func.attr}() assigned to '{target_name}' but '.returncode' / '.check_returncode()' never accessed",
             ))
     return findings
+
+
+def _walk_same_scope(fn_node):
+    """Walk descendants of fn_node but do NOT descend into nested
+    FunctionDef / AsyncFunctionDef / Lambda bodies."""
+    stack = list(ast.iter_child_nodes(fn_node))
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+
+
+def _is_test_file(file_path: str) -> bool:
+    parts = file_path.replace("\\", "/").split("/")
+    name = parts[-1]
+    if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    return any(p in ("tests", "test") for p in parts[:-1])
+
+
+def _check_assert_in_non_test(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag `assert` outside tests/ — stripped under `python -O`."""
+    if _is_test_file(file_path):
+        return []
+    findings = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assert):
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="ASSERT_IN_NON_TEST", severity="med",
+                desc="assert outside tests/ — stripped under 'python -O'; use explicit raise instead",
+            ))
+    return findings
+
+
+def _has_main_guard(tree: ast.Module) -> bool:
+    for stmt in tree.body:
+        if not isinstance(stmt, ast.If):
+            continue
+        test = stmt.test
+        if (isinstance(test, ast.Compare) and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq)
+                and isinstance(test.left, ast.Name) and test.left.id == "__name__"
+                and len(test.comparators) == 1
+                and isinstance(test.comparators[0], ast.Constant)
+                and test.comparators[0].value == "__main__"):
+            return True
+    return False
+
+
+_ENTRY_POINT_NAMES = {"__main__.py", "cli.py", "main.py", "run.py", "manage.py", "app.py"}
+
+
+def _is_entry_point_file(file_path: str, tree: ast.Module) -> bool:
+    name = file_path.replace("\\", "/").split("/")[-1]
+    if name in _ENTRY_POINT_NAMES or name.endswith("_cli.py") or name.endswith("-cli.py"):
+        return True
+    return _has_main_guard(tree)
+
+
+def _check_sys_exit_in_library(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag sys.exit()/exit()/quit() calls in library-style modules. Files that are
+    entry points (have __main__ guard, or named cli.py / main.py / __main__.py /
+    *_cli.py / run.py / manage.py / app.py) are exempt — sys.exit() there is legit."""
+    if _is_entry_point_file(file_path, tree):
+        return []
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        call_name = None
+        if isinstance(func, ast.Name) and func.id in ("exit", "quit"):
+            call_name = func.id
+        elif (isinstance(func, ast.Attribute) and func.attr == "exit"
+              and isinstance(func.value, ast.Name) and func.value.id == "sys"):
+            call_name = "sys.exit"
+        if call_name:
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="SYS_EXIT_IN_LIBRARY", severity="med",
+                desc=f"{call_name}() in a library-style module — kills host process if imported",
+            ))
+    return findings
+
+
+_LOG_METHODS = {"debug", "info", "warning", "warn", "error", "critical", "exception", "log"}
+
+
+def _check_f_string_in_logging(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag `logger.info(f"...")` — breaks lazy formatting; eager-evaluates even when
+    log level filters the message."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr in _LOG_METHODS):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if isinstance(first, ast.JoinedStr):
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="F_STRING_IN_LOGGING", severity="low",
+                desc=f".{func.attr}(f\"...\") — breaks lazy formatting; use .{func.attr}('... %s ...', arg)",
+            ))
+    return findings
+
+
+def _check_multi_stmt_pytest_raises(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag `with pytest.raises(X): stmt1; stmt2` — can't tell which statement raised."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.With):
+            continue
+        has_pytest_raises = False
+        for item in node.items:
+            expr = item.context_expr
+            if isinstance(expr, ast.Call):
+                f = expr.func
+                if (isinstance(f, ast.Attribute) and f.attr == "raises"
+                        and isinstance(f.value, ast.Name) and f.value.id == "pytest"):
+                    has_pytest_raises = True
+                    break
+        if not has_pytest_raises:
+            continue
+        body = [s for s in node.body
+                if not (isinstance(s, ast.Expr) and isinstance(getattr(s, "value", None), (ast.Constant,)))]
+        if len(body) > 1:
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="MULTI_STMT_PYTEST_RAISES", severity="low",
+                desc="with pytest.raises(): body has multiple statements — can't tell which raised; split the with",
+            ))
+    return findings
+
+
+_BLOCKING_IN_ASYNC = {
+    "requests.get", "requests.post", "requests.put", "requests.delete",
+    "requests.patch", "requests.head", "requests.options", "requests.request",
+    "urllib.request.urlopen",
+    "time.sleep",
+    "subprocess.run", "subprocess.call", "subprocess.check_call",
+    "subprocess.check_output", "subprocess.Popen",
+}
+
+
+def _check_blocking_io_in_async(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag known blocking I/O calls inside async def (event-loop killers)."""
+    findings = []
+    for afn in ast.walk(tree):
+        if not isinstance(afn, ast.AsyncFunctionDef):
+            continue
+        for node in _walk_same_scope(afn):
+            if not isinstance(node, ast.Call):
+                continue
+            fq = _qualified_call(node.func)
+            if fq in _BLOCKING_IN_ASYNC:
+                findings.append(LintFinding(
+                    file_path=file_path, line=node.lineno,
+                    rule="BLOCKING_IO_IN_ASYNC", severity="med",
+                    desc=f"{fq}() inside async def '{afn.name}' — blocks the event loop; use an async equivalent",
+                ))
+    return findings
+
+
+def _qualified_call(func_node) -> Optional[str]:
+    """Return 'module.attr' or 'module.sub.attr' for Attribute chains; None otherwise."""
+    if isinstance(func_node, ast.Attribute):
+        parts = [func_node.attr]
+        cur = func_node.value
+        while isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.append(cur.id)
+            return ".".join(reversed(parts))
+    return None
+
+
+def _extract_target_names(target) -> set:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    names = set()
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for elt in target.elts:
+            names.update(_extract_target_names(elt))
+    return names
+
+
+def _check_fn_in_loop_late_binding(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag lambda / nested def inside a for/while that references the loop variable
+    without capturing it as a default arg (classic late-binding closure trap).
+    Skipped if the name is captured via default (lambda x=x: ...) or locally rebound."""
+    findings = []
+    for loop in ast.walk(tree):
+        if not isinstance(loop, (ast.For, ast.AsyncFor)):
+            continue
+        target_names = _extract_target_names(loop.target)
+        if not target_names:
+            continue
+        for inner in ast.walk(loop):
+            if inner is loop:
+                continue
+            if not isinstance(inner, (ast.Lambda, ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            captured = {a.arg for a in inner.args.args}
+            captured.update(a.arg for a in inner.args.kwonlyargs)
+            captured.update(a.arg for a in getattr(inner.args, "posonlyargs", []))
+            rebound = set()
+            for sub in ast.walk(inner):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Store):
+                    rebound.add(sub.id)
+            uncaptured = set()
+            for sub in ast.walk(inner):
+                if isinstance(sub, ast.Name) and isinstance(sub.ctx, ast.Load):
+                    if sub.id in target_names and sub.id not in captured and sub.id not in rebound:
+                        uncaptured.add(sub.id)
+            if uncaptured:
+                kind = "lambda" if isinstance(inner, ast.Lambda) else type(inner).__name__
+                findings.append(LintFinding(
+                    file_path=file_path, line=inner.lineno,
+                    rule="FN_IN_LOOP_LATE_BINDING", severity="med",
+                    desc=f"{kind} in loop closes over {sorted(uncaptured)} without default-arg capture — all calls see the LAST value",
+                ))
+    return findings
+
+
+_ROUTE_DECORATORS = {"get", "post", "put", "delete", "patch", "options", "head"}
+_SYNC_ORM_METHODS = {"query", "commit", "rollback", "flush", "refresh"}
+
+
+def _is_route_handler(fn_node) -> bool:
+    for dec in fn_node.decorator_list:
+        target = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(target, ast.Attribute) and target.attr in _ROUTE_DECORATORS:
+            return True
+    return False
+
+
+def _async_session_param_names(fn_node) -> set:
+    """Return parameter names whose type annotation mentions 'Async' (AsyncSession, AsyncEngine, etc.).
+    Accepts plain name, Subscript (Annotated[...]), Attribute, and str forward-refs."""
+    names = set()
+    all_args = (list(fn_node.args.args) + list(fn_node.args.kwonlyargs)
+                + list(getattr(fn_node.args, "posonlyargs", [])))
+    for arg in all_args:
+        ann = arg.annotation
+        if ann is None:
+            continue
+        ann_str = None
+        if isinstance(ann, ast.Name):
+            ann_str = ann.id
+        elif isinstance(ann, ast.Attribute):
+            ann_str = ann.attr
+        elif isinstance(ann, ast.Subscript):
+            val = ann.value
+            ann_str = val.id if isinstance(val, ast.Name) else getattr(val, "attr", None)
+        elif isinstance(ann, ast.Constant) and isinstance(ann.value, str):
+            ann_str = ann.value
+        if ann_str and "Async" in ann_str:
+            names.add(arg.arg)
+    return names
+
+
+def _check_sync_orm_in_async_endpoint(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag un-awaited ORM ops on AsyncSession-annotated params inside async FastAPI routes.
+    Only fires when the param's annotation contains 'Async' — sync Session with async def
+    is a valid (though event-loop-blocking) FastAPI pattern and NOT flagged here."""
+    findings = []
+    parents = _build_parent_map(tree)
+    for afn in ast.walk(tree):
+        if not isinstance(afn, ast.AsyncFunctionDef) or not _is_route_handler(afn):
+            continue
+        async_params = _async_session_param_names(afn)
+        if not async_params:
+            continue
+        for node in _walk_same_scope(afn):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr in _SYNC_ORM_METHODS):
+                continue
+            if not (isinstance(func.value, ast.Name) and func.value.id in async_params):
+                continue
+            if isinstance(parents.get(id(node)), ast.Await):
+                continue
+            findings.append(LintFinding(
+                file_path=file_path, line=node.lineno,
+                rule="SYNC_ORM_IN_ASYNC_ENDPOINT", severity="high",
+                desc=f"unawaited '{func.value.id}.{func.attr}()' — '{func.value.id}' is AsyncSession-annotated; needs 'await'",
+            ))
+    return findings
+
+
+def _check_string_concat_in_loop(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag `s += x` inside a for/while where `s` is likely a str (O(n²))."""
+    findings = []
+    parents = _build_parent_map(tree)
+    str_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    val = node.value
+                    if (isinstance(val, ast.Constant) and isinstance(val.value, str)) \
+                            or isinstance(val, ast.JoinedStr):
+                        str_names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            ann = node.annotation
+            if isinstance(ann, ast.Name) and ann.id == "str":
+                str_names.add(node.target.id)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AugAssign) or not isinstance(node.op, ast.Add):
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id not in str_names:
+            continue
+        current = parents.get(id(node))
+        in_loop = False
+        while current is not None:
+            if isinstance(current, (ast.For, ast.While, ast.AsyncFor)):
+                in_loop = True
+                break
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                break
+            current = parents.get(id(current))
+        if not in_loop:
+            continue
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="STRING_CONCAT_IN_LOOP", severity="low",
+            desc=f"'{node.target.id} += ...' inside a loop where '{node.target.id}' is str — O(n²); use list.append() + ''.join() instead",
+        ))
+    return findings
+
