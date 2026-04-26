@@ -566,15 +566,6 @@ def _check_unsatisfiable_conditions(tree: ast.Module, file_path: str) -> list[Li
                     severity="high",
                     desc=f"'{kind} {repr(test.value)}:' — condition is always false, body is dead code",
                 ))
-            elif isinstance(test, ast.NameConstant) and test.value in _FALSY:
-                kind = "if" if isinstance(node, ast.If) else "while"
-                findings.append(LintFinding(
-                    file_path=file_path,
-                    line=node.lineno,
-                    rule="UNSATISFIABLE_CONDITION",
-                    severity="high",
-                    desc=f"'{kind} {repr(test.value)}:' — condition is always false, body is dead code",
-                ))
 
     return findings
 
