@@ -612,7 +612,7 @@ def _check_type_mismatch_heuristics(tree: ast.Module, file_path: str) -> list[Li
                 line=node.lineno,
                 rule="MIXED_RETURN_TYPES",
                 severity="med",
-                desc=f"Function '{node.name}' returns both None and {'/'.join(other)} in different branches — callers may not handle None",
+                desc=f"Function '{node.name}' returns both None and {'/'.join(sorted(other))} in different branches — callers may not handle None",
             ))
 
     return findings

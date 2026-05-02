@@ -144,8 +144,9 @@ def print_diff_report(d: dict, max_show: int = 25) -> None:
     print()
 
 
-def run_diff(repo_map, baseline_spec: str, project_root: Path) -> int:
-    """Entry point from cli. Returns 0 if no NEW HIGH issues, else 1."""
+def run_diff_data(repo_map, baseline_spec: str, project_root: Path) -> tuple[int, dict | None]:
+    """Like run_diff, but also returns the diff dict so callers (e.g., HTML
+    report) can render it. Returns (exit_code, diff_dict_or_None)."""
     # Convert RepoMap to dict for finding extraction
     if hasattr(repo_map, "to_dict"):
         cur_dict = repo_map.to_dict()
@@ -156,8 +157,6 @@ def run_diff(repo_map, baseline_spec: str, project_root: Path) -> int:
 
     baseline = load_baseline(baseline_spec, project_root)
 
-    # Always update the rolling baseline cache so the next `--diff auto`
-    # run has something to compare against.
     try:
         (project_root / ".codemapper-baseline.json").write_text(
             json.dumps(cur_dict, default=str, indent=2), encoding="utf-8"
@@ -168,13 +167,17 @@ def run_diff(repo_map, baseline_spec: str, project_root: Path) -> int:
     if baseline is None:
         print()
         print(f"  [diff] No baseline at '{baseline_spec}' — initialized for next run.")
-        return 0
+        return 0, None
 
     cur_findings = _collect_findings(cur_dict)
     base_findings = _collect_findings(baseline)
     d = diff_findings(cur_findings, base_findings)
     print_diff_report(d)
-
-    # Exit non-zero if any NEW HIGH-severity issue (regression gate)
     sev_counts = by_severity(d["new"])
-    return 1 if sev_counts["high"] > 0 else 0
+    return (1 if sev_counts["high"] > 0 else 0), d
+
+
+def run_diff(repo_map, baseline_spec: str, project_root: Path) -> int:
+    """Backward-compat wrapper around run_diff_data."""
+    code, _ = run_diff_data(repo_map, baseline_spec, project_root)
+    return code

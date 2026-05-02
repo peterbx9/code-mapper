@@ -124,7 +124,43 @@ def _collect_findings(repo_map_dict: dict) -> list[dict]:
     return out
 
 
-def render_html(repo_map_dict: dict, project_path: str = "") -> str:
+def _render_diff_section(diff: dict | None) -> str:
+    if not diff:
+        return ""
+    n_new = diff.get("n_new", 0)
+    n_resolved = diff.get("n_resolved", 0)
+    n_unchanged = diff.get("n_unchanged", 0)
+    if n_new == 0 and n_resolved == 0:
+        return ('<div class="diff-section">'
+                '<h2>vs Baseline</h2>'
+                '<p style="color:#888">No changes since baseline.</p></div>')
+    new_rows = "".join(
+        f'<li>[{html.escape((f.get("severity") or "?").lower())}] '
+        f'<span class="file">{html.escape(f.get("file_path") or f.get("file") or "?")}</span>:'
+        f'{f.get("line") or 0} '
+        f'<span class="rule">{html.escape(f.get("rule") or "?")}</span>'
+        f'</li>'
+        for f in (diff.get("new") or [])[:30]
+    )
+    resolved_rows = "".join(
+        f'<li><span class="file">{html.escape(f.get("file_path") or f.get("file") or "?")}</span>:'
+        f'{f.get("line") or 0} '
+        f'<span class="rule">{html.escape(f.get("rule") or "?")}</span></li>'
+        for f in (diff.get("resolved") or [])[:30]
+    )
+    return f'''<div class="diff-section" style="padding:16px 24px; background:#2a2a2a; border-bottom:1px solid #444;">
+  <h2 style="margin:0 0 12px 0; font-size:18px; color:#4ec9b0;">vs Baseline</h2>
+  <div style="display:flex; gap:24px; flex-wrap:wrap;">
+    <div class="stat high"><span class="n">{n_new}</span><span class="label">New</span></div>
+    <div class="stat" style="color:#73c990;"><span class="n">{n_resolved}</span><span class="label">Resolved</span></div>
+    <div class="stat"><span class="n">{n_unchanged}</span><span class="label">Unchanged</span></div>
+  </div>
+  {f'<h3 style="margin:16px 0 6px 0; color:#f48771; font-size:14px;">NEW:</h3><ul style="margin:0; padding-left:20px;">{new_rows}</ul>' if new_rows else ''}
+  {f'<h3 style="margin:16px 0 6px 0; color:#73c990; font-size:14px;">RESOLVED:</h3><ul style="margin:0; padding-left:20px;">{resolved_rows}</ul>' if resolved_rows else ''}
+</div>'''
+
+
+def render_html(repo_map_dict: dict, project_path: str = "", diff: dict | None = None) -> str:
     findings = _collect_findings(repo_map_dict)
     rank = {"high": 3, "med": 2, "low": 1}
     findings.sort(
@@ -163,7 +199,7 @@ def render_html(repo_map_dict: dict, project_path: str = "") -> str:
     n_classes = sum(1 for n in nodes if n.get("type") == "class")
 
     from datetime import datetime as _dt
-    return HTML_TEMPLATE.format(
+    rendered = HTML_TEMPLATE.format(
         project=html.escape(project_path or "(unknown)"),
         n_files=n_files, n_funcs=n_funcs, n_classes=n_classes,
         n_findings=len(findings), n_high=sev_counts["high"],
@@ -172,14 +208,24 @@ def render_html(repo_map_dict: dict, project_path: str = "") -> str:
             '<tr><td colspan="5" style="text-align:center;color:#888">No findings</td></tr>',
         generated=_dt.now().isoformat(timespec="seconds"),
     )
+    diff_html = _render_diff_section(diff)
+    if diff_html:
+        # Inject the diff section just below the summary
+        rendered = rendered.replace(
+            "<div class=\"controls\">",
+            diff_html + "<div class=\"controls\">",
+            1,
+        )
+    return rendered
 
 
-def write_html_report(repo_map, output_path: Path, project_path: str = "") -> Path:
+def write_html_report(repo_map, output_path: Path, project_path: str = "",
+                      diff: dict | None = None) -> Path:
     if hasattr(repo_map, "to_dict"):
         d = repo_map.to_dict()
     elif hasattr(repo_map, "stats"):
         d = {"stats": repo_map.stats, "nodes": []}
     else:
         d = repo_map
-    output_path.write_text(render_html(d, project_path), encoding="utf-8")
+    output_path.write_text(render_html(d, project_path, diff=diff), encoding="utf-8")
     return output_path

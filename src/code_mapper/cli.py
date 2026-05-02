@@ -387,16 +387,18 @@ def main():
         stats = apply_fixes(project_root, all_findings, dry_run=args.dry_run)
         print_fix_report(stats, dry_run=args.dry_run)
 
+    # Run diff first so its result can be embedded in the HTML report
+    diff_exit = 0
+    diff_result = None
+    if args.diff is not None:
+        from .diff import run_diff_data
+        diff_exit, diff_result = run_diff_data(repo_map, args.diff, project_root)
+
     if args.html is not None:
         from .html_report import write_html_report
         out_html = Path(args.html) if Path(args.html).is_absolute() else (project_root / args.html)
-        write_html_report(repo_map, out_html, str(project_root))
+        write_html_report(repo_map, out_html, str(project_root), diff=diff_result)
         print(f"HTML report: {out_html}")
-
-    diff_exit = 0
-    if args.diff is not None:
-        from .diff import run_diff
-        diff_exit = run_diff(repo_map, args.diff, project_root)
 
     fail_exit = _exit_code_for_findings(repo_map, args.fail_on)
     return diff_exit or fail_exit

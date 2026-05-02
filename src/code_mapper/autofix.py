@@ -19,7 +19,11 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-FIXABLE_RULES = {"DEAD_IMPORT", "UNUSED_PARAM"}
+FIXABLE_RULES = {"DEAD_IMPORT", "UNUSED_PARAM", "DEAD_FUTURE_IMPORT"}
+
+_FUTURE_ANNOTATIONS_RE = re.compile(
+    r"^\s*from\s+__future__\s+import\s+annotations\s*$"
+)
 
 
 def _findings_for_rule(findings: list[dict], rule: str) -> list[dict]:
@@ -100,6 +104,19 @@ def _fix_unused_param(source_lines: list[str], findings: list[dict]) -> tuple[li
     return source_lines, fixes
 
 
+def _strip_future_annotations(source_lines: list[str]) -> tuple[list[str], int]:
+    """Independent of linter findings — drop `from __future__ import annotations`
+    on Python 3.11+ where it's a no-op. Idempotent."""
+    new_lines = []
+    dropped = 0
+    for ln in source_lines:
+        if _FUTURE_ANNOTATIONS_RE.match(ln):
+            dropped += 1
+            continue
+        new_lines.append(ln)
+    return new_lines, dropped
+
+
 def apply_fixes(
     project_root: Path,
     findings: list[dict],
@@ -111,7 +128,8 @@ def apply_fixes(
     rules_set = set(rules) if rules else FIXABLE_RULES
     stats: dict[str, dict[str, int]] = {}
 
-    for rule in rules_set:
+    # First pass: linter-driven fixes
+    for rule in rules_set & {"DEAD_IMPORT", "UNUSED_PARAM"}:
         rule_findings = _findings_for_rule(findings, rule)
         if not rule_findings:
             continue
@@ -139,6 +157,30 @@ def apply_fixes(
 
             if not dry_run:
                 full_path.write_text("".join(lines), encoding="utf-8")
+
+    # Second pass: independent DEAD_FUTURE_IMPORT (catches what linter misses)
+    if "DEAD_FUTURE_IMPORT" in rules_set:
+        for py_file in project_root.rglob("*.py"):
+            try:
+                rel = py_file.relative_to(project_root)
+            except ValueError:
+                continue
+            rel_str = str(rel).replace("\\", "/")
+            if any(part.startswith(".") or part == "__pycache__"
+                   or part == "node_modules" or part == ".venv"
+                   for part in rel.parts):
+                continue
+            try:
+                source = py_file.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            lines = source.splitlines(keepends=True)
+            new_lines, n = _strip_future_annotations(lines)
+            if n == 0:
+                continue
+            stats.setdefault(rel_str, {})["DEAD_FUTURE_IMPORT"] = n
+            if not dry_run:
+                py_file.write_text("".join(new_lines), encoding="utf-8")
 
     return stats
 
