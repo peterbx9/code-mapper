@@ -314,6 +314,25 @@ def main():
         "--fail-on", choices=["low", "med", "high"], default=None,
         help="Exit non-zero if any finding at this severity or higher. For CI integration.",
     )
+    parser.add_argument(
+        "--diff", default=None, metavar="BASELINE",
+        help="Compare findings against a baseline. BASELINE can be a path "
+             "to a saved repo-map.json, a git ref (HEAD~1, main, SHA), or "
+             "'auto' to use .codemapper-baseline.json.",
+    )
+    parser.add_argument(
+        "--html", nargs="?", const="repo-map-report.html", default=None,
+        metavar="OUT",
+        help="Render an HTML report. Default output: repo-map-report.html",
+    )
+    parser.add_argument(
+        "--fix", action="store_true",
+        help="Auto-fix DEAD_IMPORT and UNUSED_PARAM lint findings.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Used with --fix to preview changes without writing files.",
+    )
 
     args = parser.parse_args()
 
@@ -360,7 +379,27 @@ def main():
         _run_claude(project_root, repo_map, args)
 
     _write_repo_map(repo_map, args.output, project_root)
-    return _exit_code_for_findings(repo_map, args.fail_on)
+
+    # Optional post-processing modes
+    if args.fix:
+        from .autofix import apply_fixes, print_fix_report, FIXABLE_RULES
+        all_findings = _collect_all_findings(repo_map)
+        stats = apply_fixes(project_root, all_findings, dry_run=args.dry_run)
+        print_fix_report(stats, dry_run=args.dry_run)
+
+    if args.html is not None:
+        from .html_report import write_html_report
+        out_html = Path(args.html) if Path(args.html).is_absolute() else (project_root / args.html)
+        write_html_report(repo_map, out_html, str(project_root))
+        print(f"HTML report: {out_html}")
+
+    diff_exit = 0
+    if args.diff is not None:
+        from .diff import run_diff
+        diff_exit = run_diff(repo_map, args.diff, project_root)
+
+    fail_exit = _exit_code_for_findings(repo_map, args.fail_on)
+    return diff_exit or fail_exit
 
 
 if __name__ == "__main__":
