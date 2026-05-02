@@ -367,14 +367,23 @@ def main():
     print(f"Mapping: {project_root}")
     repo_map = assemble_map(project_root, config)
     if args.js:
-        from .js_parser import parse_js_project
         from .assembler import DEFAULT_EXCLUDE
         exclude = set((config or {}).get("exclude", [])) | DEFAULT_EXCLUDE
-        js_nodes, js_edges = parse_js_project(project_root, exclude)
+        # Phase 2 (tree-sitter) preferred; fall back to Phase 1 (regex) if unavailable
+        from .js_parser_v2 import AVAILABLE as TS_AVAILABLE, parse_js_project_v2
+        if TS_AVAILABLE:
+            js_nodes, js_edges = parse_js_project_v2(project_root, exclude)
+            engine = "tree-sitter"
+        else:
+            from .js_parser import parse_js_project
+            js_nodes, js_edges = parse_js_project(project_root, exclude)
+            engine = "regex (fallback)"
         repo_map.nodes.extend(js_nodes)
         repo_map.edges.extend(js_edges)
-        print(f"  + JS/TS: {sum(1 for n in js_nodes if n.type.value == 'file')} files, "
+        print(f"  + JS/TS [{engine}]: "
+              f"{sum(1 for n in js_nodes if n.type.value == 'file')} files, "
               f"{sum(1 for n in js_nodes if n.type.value == 'function')} functions, "
+              f"{sum(1 for n in js_nodes if n.type.value == 'class')} classes, "
               f"{sum(1 for e in js_edges if e.type.value == 'import')} imports")
     _print_map_summary(repo_map)
 
