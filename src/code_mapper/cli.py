@@ -330,6 +330,10 @@ def main():
         help="Auto-fix DEAD_IMPORT and UNUSED_PARAM lint findings.",
     )
     parser.add_argument(
+        "--cycles", action="store_true",
+        help="Detect circular import dependencies via Tarjan's SCC.",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Used with --fix to preview changes without writing files.",
     )
@@ -377,6 +381,12 @@ def main():
 
     if args.claude:
         _run_claude(project_root, repo_map, args)
+
+    if args.cycles:
+        from .cycles import find_cycles, print_cycle_report
+        cycle_findings = find_cycles(repo_map)
+        print_cycle_report(cycle_findings)
+        repo_map.stats["cycles"] = cycle_findings
 
     _write_repo_map(repo_map, args.output, project_root)
 
