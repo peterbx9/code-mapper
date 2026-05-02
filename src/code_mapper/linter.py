@@ -161,6 +161,10 @@ def lint_project(project_root: Path, repo_map: Optional[RepoMap] = None,
         file_findings.extend(_check_sync_orm_in_async_endpoint(tree, rel))
         file_findings.extend(_check_string_concat_in_loop(tree, rel))
         file_findings.extend(_check_division_no_zero_guard(tree, rel))
+        file_findings.extend(_check_shell_true_with_fstring(tree, rel))
+        file_findings.extend(_check_missing_timeout_on_http(tree, rel))
+        file_findings.extend(_check_hardcoded_secret_like(tree, rel, source))
+        file_findings.extend(_check_non_atomic_read_write(tree, rel))
 
         # Drop findings suppressed by `# noqa` comments on their line
         for f in file_findings:
@@ -1627,7 +1631,198 @@ def _check_open_without_encoding(tree: ast.Module, file_path: str) -> list[LintF
     return findings
 
 
-_SUBPROCESS_FNS = {"run", "Popen", "call"}
+_SUBPROCESS_FNS = {"run", "Popen", "call", "check_call", "check_output"}
+
+
+def _check_shell_true_with_fstring(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag subprocess.{run,Popen,call} called with shell=True AND a JoinedStr
+    (f-string) or string concatenation as first arg. Command injection via
+    interpolated user data."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_subp = (
+            isinstance(func, ast.Attribute)
+            and func.attr in _SUBPROCESS_FNS
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"
+        )
+        if not is_subp:
+            continue
+        has_shell_true = any(
+            kw.arg == "shell" and isinstance(kw.value, ast.Constant)
+            and kw.value.value is True
+            for kw in node.keywords
+        )
+        if not has_shell_true:
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        is_dynamic = isinstance(first, ast.JoinedStr) or (
+            isinstance(first, ast.BinOp) and isinstance(first.op, (ast.Add, ast.Mod))
+        )
+        if not is_dynamic:
+            continue
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="SHELL_TRUE_WITH_FSTRING", severity="high",
+            desc="subprocess with shell=True + f-string/concat — command injection if any "
+                 "interpolated value is user-controlled",
+        ))
+    return findings
+
+
+_HTTP_LIB_FNS = {
+    "requests": {"get", "post", "put", "delete", "patch", "head", "options", "request"},
+    "httpx":    {"get", "post", "put", "delete", "patch", "head", "options", "request"},
+}
+# urllib.request.urlopen() and Session().<method> are also flagged
+_HTTP_INSTANCE_METHODS = {"get", "post", "put", "delete", "patch", "head",
+                          "options", "request"}
+
+
+def _check_missing_timeout_on_http(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Flag HTTP client calls without timeout= kwarg. No-timeout HTTP is never
+    correct — process hangs forever on flaky network."""
+    findings = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        match = None
+        # requests.get(...) / httpx.post(...) — module.method
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            mod, method = func.value.id, func.attr
+            if mod in _HTTP_LIB_FNS and method in _HTTP_LIB_FNS[mod]:
+                match = f"{mod}.{method}"
+        # urllib.request.urlopen(...)
+        if (isinstance(func, ast.Attribute) and func.attr == "urlopen"
+                and isinstance(func.value, ast.Attribute)
+                and func.value.attr == "request"
+                and isinstance(func.value.value, ast.Name)
+                and func.value.value.id == "urllib"):
+            match = "urllib.request.urlopen"
+        if match is None:
+            continue
+        if any(kw.arg == "timeout" for kw in node.keywords):
+            continue
+        findings.append(LintFinding(
+            file_path=file_path, line=node.lineno,
+            rule="MISSING_TIMEOUT_ON_HTTP", severity="high",
+            desc=f"{match}() without timeout= — process hangs indefinitely on flaky network",
+        ))
+    return findings
+
+
+# Specific high-confidence secret patterns. Tuned for zero false positives.
+_SECRET_PATTERNS = [
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "OpenAI/Anthropic-style API key"),
+    (re.compile(r"\bghp_[A-Za-z0-9]{36}\b"), "GitHub personal access token"),
+    (re.compile(r"\bgho_[A-Za-z0-9]{36}\b"), "GitHub OAuth token"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AWS access key ID"),
+    (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), "Google API key"),
+    (re.compile(r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"),
+     "Slack incoming webhook"),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"), "Slack OAuth token"),
+    (re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |)PRIVATE KEY-----"),
+     "Private key embedded in source"),
+]
+
+
+def _check_hardcoded_secret_like(tree: ast.Module, file_path: str,
+                                   source: str) -> list[LintFinding]:
+    """Scan string literals for known-secret patterns. Skips test/example files
+    (path contains 'test' or 'example' or 'fixture' segment)."""
+    findings = []
+    fp_low = file_path.lower().replace("\\", "/")
+    if any(seg in fp_low for seg in ("/test", "tests/", "/example",
+                                       "examples/", "/fixture", "fixtures/")):
+        return findings
+    seen: set[tuple[int, str]] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        s = node.value
+        if len(s) < 16:
+            continue
+        for pat, label in _SECRET_PATTERNS:
+            if pat.search(s):
+                key = (node.lineno, label)
+                if key in seen:
+                    continue
+                seen.add(key)
+                findings.append(LintFinding(
+                    file_path=file_path, line=node.lineno,
+                    rule="HARDCODED_SECRET_LIKE", severity="high",
+                    desc=f"String literal matches {label} pattern — "
+                         "move to env var / .env / secret manager",
+                ))
+                break
+    return findings
+
+
+def _check_non_atomic_read_write(tree: ast.Module, file_path: str) -> list[LintFinding]:
+    """Heuristic: in a function, if a SQL SELECT.execute() / fetchone() is
+    immediately followed by an INSERT/UPDATE/DELETE on the same conn without
+    a BEGIN IMMEDIATE / BEGIN TRANSACTION between them, flag.
+
+    Conservative — only fires when both operations are on the same `conn` /
+    `cur` / `cursor` variable name in the same function body."""
+    findings = []
+
+    def _exec_sql_kind(call: ast.Call) -> str | None:
+        """Return 'select'/'mutate' if call is .execute('...sql...')."""
+        if not (isinstance(call.func, ast.Attribute) and call.func.attr == "execute"):
+            return None
+        if not call.args or not isinstance(call.args[0], ast.Constant):
+            return None
+        sql = (call.args[0].value or "").strip().upper()
+        if sql.startswith("SELECT"):
+            return "select"
+        if any(sql.startswith(verb) for verb in ("INSERT", "UPDATE", "DELETE")):
+            return "mutate"
+        if "BEGIN" in sql.split()[:2]:
+            return "begin"
+        return None
+
+    def _conn_var(call: ast.Call) -> str | None:
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            return call.func.value.id
+        return None
+
+    for func_node in ast.walk(tree):
+        if not isinstance(func_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        # Walk statements linearly within this function body
+        # State: per conn-var, last-seen sql-kind + line, plus whether BEGIN seen
+        last_select: dict[str, int] = {}
+        begin_seen: set[str] = set()
+        for stmt in ast.walk(func_node):
+            if not isinstance(stmt, ast.Call):
+                continue
+            kind = _exec_sql_kind(stmt)
+            if kind is None:
+                continue
+            cv = _conn_var(stmt)
+            if cv is None:
+                continue
+            if kind == "begin":
+                begin_seen.add(cv)
+            elif kind == "select":
+                last_select[cv] = stmt.lineno
+            elif kind == "mutate":
+                if cv in last_select and cv not in begin_seen:
+                    findings.append(LintFinding(
+                        file_path=file_path, line=stmt.lineno,
+                        rule="NON_ATOMIC_READ_WRITE", severity="med",
+                        desc=f"INSERT/UPDATE/DELETE on '{cv}' follows SELECT (line "
+                             f"{last_select[cv]}) without BEGIN — race window",
+                    ))
+                last_select.pop(cv, None)
+    return findings
 
 
 def _check_subprocess_no_returncode_check(tree: ast.Module, file_path: str) -> list[LintFinding]:
