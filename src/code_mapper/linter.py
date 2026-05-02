@@ -1840,6 +1840,10 @@ def _check_subprocess_no_returncode_check(tree: ast.Module, file_path: str) -> l
             continue
         if not (isinstance(func.value, ast.Name) and func.value.id == "subprocess"):
             continue
+        # check_call and check_output raise CalledProcessError by default
+        # on non-zero exit — they DON'T need explicit returncode handling.
+        if func.attr in ("check_call", "check_output"):
+            continue
         has_check_true = any(
             kw.arg == "check" and isinstance(kw.value, ast.Constant) and kw.value.value is True
             for kw in node.keywords
