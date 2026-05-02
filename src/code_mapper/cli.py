@@ -346,6 +346,11 @@ def main():
         help="Also parse JS/TS/JSX/TSX files (regex-based, Phase-1).",
     )
     parser.add_argument(
+        "--graph", nargs="?", const="repo-map-graph.html", default=None,
+        metavar="OUT",
+        help="Render a D3 force-directed graph view. Default: repo-map-graph.html",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Used with --fix to preview changes without writing files.",
     )
@@ -392,6 +397,21 @@ def main():
 
     if args.lint:
         _run_lint(project_root, repo_map, config)
+        # JS lint runs after Python lint, appending to lint_findings
+        if args.js:
+            from .js_linter import lint_js_project
+            from .assembler import DEFAULT_EXCLUDE
+            exclude = set((config or {}).get("exclude", [])) | DEFAULT_EXCLUDE
+            js_findings = lint_js_project(project_root, exclude)
+            if js_findings:
+                print(f"  JS LINT FINDINGS ({len(js_findings)}):")
+                for f in js_findings[:50]:
+                    print(f"    [{f.severity}] {f.file_path}:{f.line} {f.rule}: {f.desc}")
+                if len(js_findings) > 50:
+                    print(f"    ... ({len(js_findings) - 50} more)")
+                existing = repo_map.stats.get("lint_findings", [])
+                existing.extend([f.to_dict() for f in js_findings])
+                repo_map.stats["lint_findings"] = existing
     if args.xref:
         _run_xref(project_root, repo_map, config)
 
@@ -437,6 +457,12 @@ def main():
         out_html = Path(args.html) if Path(args.html).is_absolute() else (project_root / args.html)
         write_html_report(repo_map, out_html, str(project_root), diff=diff_result)
         print(f"HTML report: {out_html}")
+
+    if args.graph is not None:
+        from .graph_view import write_graph_html
+        out_g = Path(args.graph) if Path(args.graph).is_absolute() else (project_root / args.graph)
+        write_graph_html(repo_map, out_g, str(project_root))
+        print(f"Graph view: {out_g}")
 
     fail_exit = _exit_code_for_findings(repo_map, args.fail_on)
     return diff_exit or fail_exit
