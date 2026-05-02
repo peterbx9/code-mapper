@@ -334,6 +334,14 @@ def main():
         help="Detect circular import dependencies via Tarjan's SCC.",
     )
     parser.add_argument(
+        "--hotspots", action="store_true",
+        help="Rank files by complexity × git churn (bug-factory detector).",
+    )
+    parser.add_argument(
+        "--hotspot-days", type=int, default=180,
+        help="Git lookback window for --hotspots (default: 180 days).",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Used with --fix to preview changes without writing files.",
     )
@@ -387,6 +395,12 @@ def main():
         cycle_findings = find_cycles(repo_map)
         print_cycle_report(cycle_findings)
         repo_map.stats["cycles"] = cycle_findings
+
+    if args.hotspots:
+        from .hotspots import find_hotspots, print_hotspot_report
+        hotspot_rows = find_hotspots(repo_map, project_root, args.hotspot_days)
+        print_hotspot_report(hotspot_rows)
+        repo_map.stats["hotspots"] = hotspot_rows
 
     _write_repo_map(repo_map, args.output, project_root)
 
