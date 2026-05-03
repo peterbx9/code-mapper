@@ -97,10 +97,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                   fill: #ccc; }
   .react-flow__minimap { background: #1a1a1a; }
   /* Cluster group node */
-  .cm-cluster { padding: 24px 12px 12px 12px; border-radius: 6px;
-                border: 1px dashed rgba(255,255,255,0.15); pointer-events: none; }
+  .cm-cluster { width: 100%; height: 100%; border-radius: 6px;
+                border: 1px dashed rgba(255,255,255,0.18);
+                pointer-events: none; position: relative; }
   .cm-cluster .label { position: absolute; top: 4px; left: 8px;
-                        font-size: 11px; color: #888; font-weight: 600; }
+                        font-size: 12px; color: #aaa; font-weight: 600;
+                        font-family: -apple-system, Segoe UI, sans-serif;
+                        letter-spacing: 0.5px; text-transform: uppercase; }
+  /* Inline finding list (when expanded) */
+  .cm-node .findings-inline { margin-top: 6px; max-width: 280px; }
+  .cm-node .findings-inline .f { padding: 2px 0; font-size: 10px; color: #aaa; }
+  .cm-node .findings-inline .f.high { color: #f48771; }
+  .cm-node .findings-inline .f.med { color: #dcdcaa; }
+  .cm-node .expand-btn { display: inline-block; margin-left: 6px;
+                          padding: 0 5px; background: #333; color: #888;
+                          border-radius: 2px; cursor: pointer; font-size: 10px; }
+  .cm-node .expand-btn:hover { background: #444; color: #ccc; }
 </style>
 </head><body>
 <header>
@@ -139,6 +151,7 @@ for (const f of (data.findings || [])) {
 
 // Custom node renderer
 function CMNode({ data: nd, selected }) {
+  const [expanded, setExpanded] = useState(false);
   const findings = findingsByFile[nd.path] || [];
   const counts = { high: 0, med: 0, low: 0 };
   for (const f of findings) {
@@ -146,19 +159,43 @@ function CMNode({ data: nd, selected }) {
     if (counts[sev] !== undefined) counts[sev]++;
   }
   const typeClass = `type-${nd.type || "file"}`;
+  const showFindings = expanded && findings.length > 0;
   return React.createElement("div",
     { className: `cm-node ${selected ? "selected" : ""}` },
     React.createElement(Handle, { type: "target", position: Position.Left, style: { background: "#555" } }),
     React.createElement("div", null,
       React.createElement("span", { className: `type-badge ${typeClass}` }, nd.type || "file"),
-      React.createElement("span", { className: "name" }, nd.name)
+      React.createElement("span", { className: "name" }, nd.name),
+      findings.length > 0 && React.createElement("span", {
+        className: "expand-btn",
+        onClick: (e) => { e.stopPropagation(); setExpanded(x => !x); },
+      }, expanded ? "−" : "+")
     ),
     React.createElement("div", { className: "stats" },
       `cx ${nd.complexity || 0}`,
       counts.high > 0 && React.createElement("span", { className: "lint-high" }, ` · ${counts.high}H`),
       counts.med > 0 && React.createElement("span", { className: "lint-med" }, ` · ${counts.med}M`)
     ),
+    showFindings && React.createElement("div", { className: "findings-inline" },
+      findings.slice(0, 8).map((f, i) =>
+        React.createElement("div", {
+          key: i, className: `f ${(f.severity || "low").toLowerCase()}`,
+        }, `${f.rule}:${f.line}`)
+      ),
+      findings.length > 8 && React.createElement("div", { className: "f" },
+        `+ ${findings.length - 8} more (sidebar)`)
+    ),
     React.createElement(Handle, { type: "source", position: Position.Right, style: { background: "#555" } })
+  );
+}
+
+// Cluster (group region) node renderer — colored bounding box for logic blocks
+function CMCluster({ data: nd }) {
+  return React.createElement("div", {
+    className: "cm-cluster",
+    style: { background: nd.color || "rgba(78,201,176,0.06)" },
+  },
+    React.createElement("div", { className: "label" }, nd.label || "")
   );
 }
 
@@ -193,6 +230,42 @@ function hierarchicalLayout(nodes, edges) {
   return out;
 }
 
+// Color edges by type (import gray, call teal, route pink, table_access yellow)
+const EDGE_COLORS = {
+  import: "#555", call: "#4ec9b0", route: "#f48771",
+  table_access: "#dcdcaa", inheritance: "#c586c0", decorator: "#9cdcfe",
+  reexport: "#888",
+};
+
+// Compute bounding box per logic block once nodes are laid out
+function computeClusterBBoxes(nodes, blocks) {
+  const byNodeId = Object.fromEntries(nodes.map(n => [n.id, n]));
+  const out = [];
+  blocks.forEach((blk, i) => {
+    const members = (blk.node_ids || []).map(id => byNodeId[id]).filter(Boolean);
+    if (members.length < 2) return;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const m of members) {
+      const x = m.position.x, y = m.position.y;
+      const w = 200, h = 80;  // approx node size
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x + w > maxX) maxX = x + w;
+      if (y + h > maxY) maxY = y + h;
+    }
+    const PAD = 24;
+    out.push({
+      id: `cluster-${i}`, type: "cluster",
+      data: { label: blk.name || `Block ${i}`, color: data.cluster_colors[i % data.cluster_colors.length] },
+      position: { x: minX - PAD, y: minY - PAD - 18 },
+      style: { width: maxX - minX + PAD * 2, height: maxY - minY + PAD * 2 + 18,
+                pointerEvents: "none", zIndex: -1 },
+      selectable: false, draggable: false,
+    });
+  });
+  return out;
+}
+
 function App() {
   const initialNodes = data.nodes.map(n => ({
     id: n.id,
@@ -203,12 +276,16 @@ function App() {
   const initialEdges = data.edges.map((e, i) => ({
     id: `e${i}`, source: e.source, target: e.target,
     type: "default", animated: false,
+    style: { stroke: EDGE_COLORS[e.edge_type] || "#555",
+             strokeWidth: 1.5, opacity: 0.45 },
+    data: { edge_type: e.edge_type },
   })).filter(e =>
     initialNodes.some(n => n.id === e.source) &&
     initialNodes.some(n => n.id === e.target)
   );
   const laid = useMemo(() => forceLayout(initialNodes, initialEdges), []);
-  const [nodes, setNodes] = useState(laid);
+  const clusters = useMemo(() => computeClusterBBoxes(laid, data.logic_blocks || []), [laid]);
+  const [nodes, setNodes] = useState([...clusters, ...laid]);
   const [edges, setEdges] = useState(initialEdges);
   const [selected, setSelected] = useState(null);
 
@@ -231,14 +308,19 @@ function App() {
       })));
     };
     window.cm.setLayout = (mode) => {
-      setNodes(ns => mode === "hierarchical"
-        ? hierarchicalLayout(ns, edges)
-        : forceLayout(ns, edges));
+      setNodes(ns => {
+        const fileNodes = ns.filter(n => n.type === "cm");
+        const laid = mode === "hierarchical"
+          ? hierarchicalLayout(fileNodes, edges)
+          : forceLayout(fileNodes, edges);
+        const newClusters = computeClusterBBoxes(laid, data.logic_blocks || []);
+        return [...newClusters, ...laid];
+      });
     };
   }, [edges]);
 
   return React.createElement(ReactFlow, {
-    nodes, edges, nodeTypes: { cm: CMNode },
+    nodes, edges, nodeTypes: { cm: CMNode, cluster: CMCluster },
     onNodesChange, onEdgesChange, onNodeClick,
     fitView: true, minZoom: 0.05, maxZoom: 4,
     style: { background: "#1a1a1a" },
@@ -306,10 +388,22 @@ def render_ui(repo_map: RepoMap, project_path: str = "") -> str:
     ]
     valid_ids = {n["id"] for n in nodes_data}
     edges_data = [
-        {"source": e.source, "target": e.target}
+        {"source": e.source, "target": e.target,
+         "edge_type": e.type.value if hasattr(e.type, "value") else str(e.type)}
         for e in repo_map.edges
-        if e.type == EdgeType.IMPORT and e.source in valid_ids and e.target in valid_ids
+        if e.source in valid_ids and e.target in valid_ids
     ]
+    # Logic blocks → cluster regions
+    logic_blocks = []
+    for blk in (repo_map.logic_blocks or []):
+        # Filter node_ids to only files (nodes_data is files-only)
+        block_files = [nid for nid in (blk.node_ids or []) if nid in valid_ids]
+        if len(block_files) < 2:
+            continue
+        logic_blocks.append({
+            "name": blk.name or "",
+            "node_ids": block_files,
+        })
     findings = []
     for key in ("lint_findings", "ai_findings", "verified_findings",
                 "claude_findings", "pattern_findings"):
@@ -320,6 +414,8 @@ def render_ui(repo_map: RepoMap, project_path: str = "") -> str:
 
     payload = json.dumps({
         "nodes": nodes_data, "edges": edges_data, "findings": findings,
+        "logic_blocks": logic_blocks,
+        "cluster_colors": CLUSTER_COLORS,
     })
     return (HTML_TEMPLATE
             .replace("__PROJECT__", html.escape(project_path or "(unknown)"))
