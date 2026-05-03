@@ -312,9 +312,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   lgcanvas.render_canvas_border = false;
   lgcanvas.allow_searchbox = false;
 
-  const nodesById = {};
   const blocksMeta = data.logic_blocks || [];
-  const { positions, blockBoxes } = layout(data.nodes || [], blocksMeta);
 
   // ---------------- Block-summary node class ----------------
   // ONE node per logic block. Big card, colored title bar = block color,
