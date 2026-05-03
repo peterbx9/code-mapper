@@ -358,18 +358,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   LiteGraph.registerNodeType("cm/block", CMBlockNode);
 
   // Per-node title text color override. LiteGraph reads
-  // NODE_TITLE_TEXT_COLOR globally, so we swap it during the draw of
-  // any node that sets `_titleTextColor`. File nodes keep the default
-  // white-on-dark; block-summary nodes use black-on-bright.
-  const _origDrawNodeShape = LGraphCanvas.prototype.drawNodeShape;
-  LGraphCanvas.prototype.drawNodeShape = function(node, ctx, ...rest) {
-    const orig = LiteGraph.NODE_TITLE_TEXT_COLOR;
-    if (node && node._titleTextColor) {
-      LiteGraph.NODE_TITLE_TEXT_COLOR = node._titleTextColor;
-    }
-    try { return _origDrawNodeShape.call(this, node, ctx, ...rest); }
-    finally { LiteGraph.NODE_TITLE_TEXT_COLOR = orig; }
-  };
+  // NODE_TITLE_TEXT_COLOR globally during drawNode (which calls
+  // drawNodeShape). We wrap both — drawNode covers the title text,
+  // drawNodeShape covers any title-bar fill that uses the constant.
+  function _wrapTitleColor(proto, methodName) {
+    const orig = proto[methodName];
+    if (!orig) return;
+    proto[methodName] = function(node, ctx, ...rest) {
+      const saved = LiteGraph.NODE_TITLE_TEXT_COLOR;
+      if (node && node._titleTextColor) {
+        LiteGraph.NODE_TITLE_TEXT_COLOR = node._titleTextColor;
+      }
+      try { return orig.call(this, node, ctx, ...rest); }
+      finally { LiteGraph.NODE_TITLE_TEXT_COLOR = saved; }
+    };
+  }
+  _wrapTitleColor(LGraphCanvas.prototype, "drawNode");
+  _wrapTitleColor(LGraphCanvas.prototype, "drawNodeShape");
 
   // ---------------- Build adjacency + blocksMeta enrichment ----------------
   const adjacency = {};
