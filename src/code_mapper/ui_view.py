@@ -36,11 +36,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   "imports": {
     "react": "https://esm.sh/react@18.3.1",
     "react-dom/client": "https://esm.sh/react-dom@18.3.1/client",
-    "@xyflow/react": "https://esm.sh/@xyflow/react@12.3.5"
+    "reactflow": "https://esm.sh/reactflow@11.11.4?bundle"
   }
 }
 </script>
-<link rel="stylesheet" href="https://esm.sh/@xyflow/react@12.3.5/dist/style.css">
+<link rel="stylesheet" href="https://esm.sh/reactflow@11.11.4/dist/style.css">
 <style>
   body { margin: 0; font-family: -apple-system, Segoe UI, sans-serif;
          background: #1a1a1a; color: #e0e0e0; overflow: hidden; }
@@ -134,12 +134,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="sidebar-content"><div class="empty">Click a node to inspect</div></div>
 </div>
 <script type="module">
+// Visible error fallback if any module fails to load
+window.addEventListener("error", (e) => {
+  const root = document.getElementById("root");
+  if (root && root.childNodes.length === 0) {
+    root.innerHTML = `<div style="padding:40px;color:#f48771;font-family:monospace;">
+      <h2>UI failed to load</h2>
+      <p><b>Error:</b> ${e.message || e.error}</p>
+      <p>Filename: ${e.filename || "?"}, line ${e.lineno || "?"}</p>
+      <p>Likely cause: esm.sh blocked, CDN slow, or React Flow ESM mismatch.</p>
+      <p>Open browser devtools → Console tab for full stack trace.</p>
+    </div>`;
+  }
+});
+window.addEventListener("unhandledrejection", (e) => {
+  const root = document.getElementById("root");
+  if (root && root.childNodes.length === 0) {
+    root.innerHTML = `<div style="padding:40px;color:#f48771;font-family:monospace;">
+      <h2>UI failed to load (promise rejection)</h2>
+      <p>${e.reason}</p>
+    </div>`;
+  }
+});
+
 import React, { useState, useMemo, useCallback, useEffect } from "react";
 import { createRoot } from "react-dom/client";
-import {
-  ReactFlow, Controls, MiniMap, Background, Handle, Position,
+import ReactFlow, {
+  Controls, MiniMap, Background, Handle, Position,
   applyNodeChanges, applyEdgeChanges,
-} from "@xyflow/react";
+} from "reactflow";
 
 const data = __DATA_JSON__;
 const findingsByFile = {};
