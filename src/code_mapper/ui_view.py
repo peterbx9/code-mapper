@@ -355,6 +355,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   CMBlockNode.prototype.onSelected = function() {
     if (this.cmBlock) renderBlockSidebar(this.cmBlock);
   };
+  // Draw our own title text in BLACK on the bright title bar.
+  // LiteGraph hands us a ctx already translated so y=0 is the node's
+  // body top; the title bar lives at -titleHeight..0.
+  CMBlockNode.prototype.onDrawTitleText = function(
+    ctx, titleHeight, size, scale, fontSize
+  ) {
+    if (this.flags && this.flags.collapsed) return;
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.font = "bold " + (fontSize || 14) + "px -apple-system, Segoe UI, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(this.title || ""), 10, -titleHeight * 0.5);
+    ctx.restore();
+  };
   LiteGraph.registerNodeType("cm/block", CMBlockNode);
 
   // Per-node title text color override. LiteGraph reads
