@@ -172,53 +172,54 @@ for (const f of (data.findings || [])) {
   findingsByFile[k].push(f);
 }
 
-// Custom node renderer
-function CMNode({ data: nd, selected }) {
-  const [expanded, setExpanded] = useState(false);
+// Custom node renderer (stateless — avoids React-instance mismatch with
+// reactflow's bundled React under esm.sh import maps).
+const h = React.createElement;
+
+function CMNode(props) {
+  const nd = props.data || {};
+  const selected = !!props.selected;
   const findings = findingsByFile[nd.path] || [];
-  const counts = { high: 0, med: 0, low: 0 };
-  for (const f of findings) {
-    const sev = (f.severity || "low").toLowerCase();
-    if (counts[sev] !== undefined) counts[sev]++;
+  let highCount = 0, medCount = 0;
+  for (let i = 0; i < findings.length; i++) {
+    const sev = String(findings[i].severity || "low").toLowerCase();
+    if (sev === "high") highCount++;
+    else if (sev === "med") medCount++;
   }
-  const typeClass = `type-${nd.type || "file"}`;
-  const showFindings = expanded && findings.length > 0;
-  return React.createElement("div",
-    { className: `cm-node ${selected ? "selected" : ""}` },
-    React.createElement(Handle, { type: "target", position: Position.Left, style: { background: "#555" } }),
-    React.createElement("div", null,
-      React.createElement("span", { className: `type-badge ${typeClass}` }, nd.type || "file"),
-      React.createElement("span", { className: "name" }, nd.name),
-      findings.length > 0 && React.createElement("span", {
-        className: "expand-btn",
-        onClick: (e) => { e.stopPropagation(); setExpanded(x => !x); },
-      }, expanded ? "−" : "+")
-    ),
-    React.createElement("div", { className: "stats" },
-      `cx ${nd.complexity || 0}`,
-      counts.high > 0 && React.createElement("span", { className: "lint-high" }, ` · ${counts.high}H`),
-      counts.med > 0 && React.createElement("span", { className: "lint-med" }, ` · ${counts.med}M`)
-    ),
-    showFindings && React.createElement("div", { className: "findings-inline" },
-      findings.slice(0, 8).map((f, i) =>
-        React.createElement("div", {
-          key: i, className: `f ${(f.severity || "low").toLowerCase()}`,
-        }, `${f.rule}:${f.line}`)
-      ),
-      findings.length > 8 && React.createElement("div", { className: "f" },
-        `+ ${findings.length - 8} more (sidebar)`)
-    ),
-    React.createElement(Handle, { type: "source", position: Position.Right, style: { background: "#555" } })
+  const typeStr = String(nd.type || "file");
+  const nameStr = String(nd.name || "");
+  const cxStr = String(nd.complexity || 0);
+
+  const headerKids = [
+    h("span", { key: "tb", className: "type-badge type-" + typeStr }, typeStr),
+    h("span", { key: "nm", className: "name" }, nameStr),
+  ];
+  if (findings.length > 0) {
+    headerKids.push(
+      h("span", { key: "fc", style: { color: "#888", marginLeft: "6px", fontSize: "10px" } },
+        "(" + findings.length + ")")
+    );
+  }
+
+  const statsKids = [h("span", { key: "cx" }, "cx " + cxStr)];
+  if (highCount > 0) statsKids.push(h("span", { key: "hi", className: "lint-high" }, " · " + highCount + "H"));
+  if (medCount > 0) statsKids.push(h("span", { key: "md", className: "lint-med" }, " · " + medCount + "M"));
+
+  return h("div", { className: "cm-node " + (selected ? "selected" : "") },
+    h(Handle, { type: "target", position: Position.Left, style: { background: "#555" } }),
+    h("div", { key: "header" }, headerKids),
+    h("div", { key: "stats", className: "stats" }, statsKids),
+    h(Handle, { type: "source", position: Position.Right, style: { background: "#555" } })
   );
 }
 
 // Cluster (group region) node renderer — colored bounding box for logic blocks
-function CMCluster({ data: nd }) {
-  return React.createElement("div", {
-    className: "cm-cluster",
-    style: { background: nd.color || "rgba(78,201,176,0.06)" },
-  },
-    React.createElement("div", { className: "label" }, nd.label || "")
+function CMCluster(props) {
+  const nd = props.data || {};
+  return h("div",
+    { className: "cm-cluster",
+      style: { background: String(nd.color || "rgba(78,201,176,0.06)") } },
+    h("div", { className: "label" }, String(nd.label || ""))
   );
 }
 
