@@ -218,6 +218,28 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   // ---------------- Constants from Python side ----------------
   const NODE_TYPE_COLORS = __NODE_TYPE_COLORS__;
 
+  // ---------------- Disambiguate duplicate file names ----------------
+  // If two files share a basename (e.g. ~/.fred/morning_scan.py and
+  // ~/.fred/dashboard/morning_scan.py), prefix the duplicates with
+  // their parent directory so the canvas shows distinct titles.
+  (function disambiguateNames() {
+    const byName = {};
+    for (const n of (data.nodes || [])) {
+      const k = (n.name || "").toLowerCase();
+      (byName[k] = byName[k] || []).push(n);
+    }
+    for (const k in byName) {
+      const group = byName[k];
+      if (group.length < 2) continue;
+      for (const n of group) {
+        const path = (n.path || "").replace(/\\/g, "/");
+        const parts = path.split("/").filter(Boolean);
+        const parent = parts.length >= 2 ? parts[parts.length - 2] : "";
+        n.name = parent ? parent + "/" + n.name : n.name;
+      }
+    }
+  })();
+
   // ---------------- Findings index ----------------
   const findingsByFile = {};
   for (const f of (data.findings || [])) {
