@@ -140,8 +140,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <input id="filter" placeholder="Filter (file, function, rule)..."
          oninput="window.cm.applyFilter(this.value)">
   <select id="viewMode" onchange="window.cm.setView(this.value)">
-    <option value="summary">Summary (logic blocks)</option>
-    <option value="detail" selected>Detail (all files)</option>
+    <option value="summary" selected>Summary (logic blocks)</option>
+    <option value="detail">Detail (all files)</option>
   </select>
   <button onclick="window.cm.fitView()">Fit</button>
   <button onclick="document.getElementById('sidebar').classList.toggle('collapsed')">
@@ -154,8 +154,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div id="blocks-panel">
   <header>
     <h3>Logic Blocks</h3>
-    <button class="panel-btn" onclick="window.cm.allBlocks(true)">Hide all</button>
-    <button class="panel-btn" onclick="window.cm.allBlocks(false)">Show all</button>
+    <button class="panel-btn" onclick="window.cm.drillBack()">↶ Summary</button>
     <button class="panel-btn"
             onclick="document.getElementById('blocks-panel').classList.toggle('collapsed')">−</button>
   </header>
@@ -317,136 +316,233 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   const blocksMeta = data.logic_blocks || [];
   const { positions, blockBoxes } = layout(data.nodes || [], blocksMeta);
 
-  // Add LGraphGroup per logic block — these are the colored regions
-  // with title bars (the "Sampler Stage 1" boxes in ComfyUI screenshots).
-  function addGroup(box, blk, color) {
-    const g = new LiteGraph.LGraphGroup();
-    g.title = blk.name || `Block ${box.bi}`;
-    g.pos = [box.x, box.y];
-    g.size = [box.w, box.h];
-    g.color = color;
-    graph.add(g);
+  // ---------------- Block-summary node class ----------------
+  // ONE node per logic block. Big card, colored title bar = block color,
+  // body shows file count + complexity total + finding totals.
+  function CMBlockNode() {
+    this.addOutput("→", "*");
+    this.addInput("←", "*");
+    this.size = [260, 110];
+    this.cmBlock = null;
   }
-  for (const box of blockBoxes) {
-    if (box.bi >= blocksMeta.length) continue;  // unassigned bucket — no group
-    const blk = blocksMeta[box.bi];
-    const color = blk.is_tests
-      ? (data.test_cluster_color || "#888888")
-      : (data.cluster_colors[box.bi % data.cluster_colors.length] || "#4ec9b0");
-    addGroup(box, blk, color);
-  }
+  CMBlockNode.title = "block";
+  CMBlockNode.prototype.onDrawForeground = function(ctx) {
+    if (!this.cmBlock) return;
+    const b = this.cmBlock;
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 13px -apple-system, Segoe UI, sans-serif";
+    ctx.fillText(b.fileCount + " files", 12, 36);
+    ctx.fillStyle = "#bbb";
+    ctx.font = "11px -apple-system, Segoe UI, sans-serif";
+    ctx.fillText("complexity " + b.totalCx, 12, 56);
+    let x = 12;
+    if (b.counts.high > 0) {
+      ctx.fillStyle = "#f48771";
+      ctx.fillText(b.counts.high + "H", x, 78); x += 32;
+    }
+    if (b.counts.med > 0) {
+      ctx.fillStyle = "#dcdcaa";
+      ctx.fillText(b.counts.med + "M", x, 78); x += 32;
+    }
+    if (b.counts.low > 0) {
+      ctx.fillStyle = "#888";
+      ctx.fillText(b.counts.low + "L", x, 78);
+    }
+    if (!b.counts.high && !b.counts.med && !b.counts.low) {
+      ctx.fillStyle = "#4a4";
+      ctx.fillText("clean", 12, 78);
+    }
+  };
+  CMBlockNode.prototype.onSelected = function() {
+    if (this.cmBlock) renderBlockSidebar(this.cmBlock);
+  };
+  LiteGraph.registerNodeType("cm/block", CMBlockNode);
 
-  // Add a node per file
-  for (const n of (data.nodes || [])) {
-    const node = LiteGraph.createNode("cm/file");
-    if (!node) continue;
-    node.title = n.name || "(unnamed)";
-    const pos = positions[n.id] || { x: 0, y: 0 };
-    node.pos = [pos.x, pos.y];
-    node.color = NODE_TYPE_COLORS[n.type] || "#3b6c8e";  // title bar
-    node.bgcolor = "#2a2a2a";  // body
-    node.cmData = n;
-    graph.add(node);
-    nodesById[n.id] = node;
-  }
-  // Connect edges (file → file imports/calls) and build adjacency map
+  // ---------------- Build adjacency + blocksMeta enrichment ----------------
   const adjacency = {};
   const fileById = {};
-  for (const fn of (data.nodes || [])) fileById[fn.id] = fn;
-  for (const id of Object.keys(nodesById)) {
-    adjacency[id] = { imports: [], importedBy: [] };
+  for (const fn of (data.nodes || [])) {
+    fileById[fn.id] = fn;
+    adjacency[fn.id] = { imports: [], importedBy: [] };
   }
   for (const e of (data.edges || [])) {
-    const a = nodesById[e.source], b = nodesById[e.target];
-    if (!a || !b) continue;
-    a.connect(0, b, 0);
+    if (!fileById[e.source] || !fileById[e.target]) continue;
     adjacency[e.source].imports.push({ id: e.target, type: e.edge_type });
     adjacency[e.target].importedBy.push({ id: e.source, type: e.edge_type });
   }
 
-  // Snapshot original colors so we can restore after highlight dims
-  for (const node of graph._nodes) {
-    if (!node.cmData) continue;
-    node._origBgcolor = node.bgcolor;
-    node._origColor = node.color;
-  }
-
-  // ---------------- Per-block hide/show panel ----------------
-  // For each layout block (skip the unassigned bucket), build a row with
-  // a swatch, name, file count, and a hide/show toggle. Toggling sets
-  // node.flags.collapsed on every member node so the contents fold into
-  // the title bar — leaving the colored group region visible.
-  const blocksList = document.getElementById("blocks-list");
-  const blockState = {};  // box.bi → hidden bool
-
-  function setBlockHidden(bi, hidden, row, tog, box) {
-    blockState[bi] = hidden;
-    for (const memberData of box.bucket) {
-      const node = nodesById[memberData.id];
-      if (!node) continue;
-      const isCollapsed = !!(node.flags && node.flags.collapsed);
-      // node.collapse() is a toggle in LiteGraph — only call when state
-      // actually needs to flip, otherwise we'll bounce back.
-      if (isCollapsed !== !!hidden && typeof node.collapse === "function") {
-        node.collapse();
-      } else {
-        node.flags = node.flags || {};
-        node.flags.collapsed = !!hidden;
-      }
-    }
-    if (row) row.classList.toggle("hidden", !!hidden);
-    if (tog) tog.textContent = hidden ? "show" : "hide";
-    lgcanvas.setDirty(true, true);
-    if (typeof lgcanvas.draw === "function") lgcanvas.draw(true, true);
-  }
-
-  // Auto-collapse threshold: any block with more files than this starts
-  // hidden so the canvas isn't dominated by mega-buckets like
-  // "Utilities / Standalone (381)". User can show them individually.
-  const AUTO_HIDE_THRESHOLD = 30;
-
-  const blockUiRows = [];  // [{bi, row, tog, box}]
-  for (const box of blockBoxes) {
-    if (box.bi >= blocksMeta.length) continue;
-    const blk = blocksMeta[box.bi];
-    const color = blk.is_tests
+  // Per-block aggregate metadata for summary nodes
+  const fileToBlock = {};
+  blocksMeta.forEach((blk, bi) => {
+    for (const id of (blk.node_ids || [])) fileToBlock[id] = bi;
+  });
+  const blockAgg = blocksMeta.map((blk, bi) => ({
+    bi, name: blk.name || `Block ${bi}`,
+    is_tests: !!blk.is_tests,
+    color: blk.is_tests
       ? (data.test_cluster_color || "#888888")
-      : (data.cluster_colors[box.bi % data.cluster_colors.length] || "#4ec9b0");
-
-    const row = document.createElement("div");
-    row.className = "block-row";
-
-    const swatch = document.createElement("span");
-    swatch.className = "swatch";
-    swatch.style.background = color;
-    row.appendChild(swatch);
-
-    const name = document.createElement("span");
-    name.className = "name";
-    name.textContent = (blk.name || `Block ${box.bi}`) + ` (${box.bucket.length})`;
-    row.appendChild(name);
-
-    const tog = document.createElement("span");
-    tog.className = "toggle";
-    tog.textContent = "hide";
-    row.appendChild(tog);
-
-    row.addEventListener("click", () => {
-      setBlockHidden(box.bi, !blockState[box.bi], row, tog, box);
-    });
-
-    blocksList.appendChild(row);
-    blockUiRows.push({ bi: box.bi, row, tog, box });
-
-    // Auto-collapse oversized blocks on initial load
-    if (box.bucket.length > AUTO_HIDE_THRESHOLD) {
-      setBlockHidden(box.bi, true, row, tog, box);
+      : (data.cluster_colors[bi % data.cluster_colors.length] || "#4ec9b0"),
+    fileCount: (blk.node_ids || []).length,
+    member_ids: blk.node_ids || [],
+    totalCx: 0, counts: { high: 0, med: 0, low: 0 },
+  }));
+  for (const n of (data.nodes || [])) {
+    const bi = fileToBlock[n.id];
+    if (bi === undefined) continue;
+    blockAgg[bi].totalCx += (n.complexity || 0);
+    const fnds = findingsByFile[n.path] || [];
+    for (const f of fnds) {
+      const sev = String(f.severity || "low").toLowerCase();
+      if (sev === "high") blockAgg[bi].counts.high++;
+      else if (sev === "med") blockAgg[bi].counts.med++;
+      else blockAgg[bi].counts.low++;
     }
   }
-  // After auto-collapse, refit so the visible blocks fill the canvas
-  setTimeout(fitView, 50);
+  // Aggregated cluster→cluster edges with counts (block i → block j)
+  const blockEdgeCounts = {};
+  for (const e of (data.edges || [])) {
+    const a = fileToBlock[e.source], b = fileToBlock[e.target];
+    if (a === undefined || b === undefined || a === b) continue;
+    const k = a + "->" + b;
+    blockEdgeCounts[k] = (blockEdgeCounts[k] || 0) + 1;
+  }
 
-  // Initial fit
+  // Track current view state + which detail-block is focused (if any)
+  const nodesById = {};        // file id → LiteGraph node (detail mode)
+  const blockNodesById = {};   // block index → LiteGraph node (summary mode)
+  let currentMode = "summary";
+  let detailFocusBlock = null;  // bi if drill-in mode, else null
+
+  // ---------------- Builders: summary + detail ----------------
+  function clearGraph() {
+    // Remove all groups + nodes
+    if (graph._groups) graph._groups.length = 0;
+    const toRemove = [...(graph._nodes || [])];
+    for (const node of toRemove) graph.remove(node);
+    for (const k in nodesById) delete nodesById[k];
+    for (const k in blockNodesById) delete blockNodesById[k];
+  }
+
+  function buildSummaryGraph() {
+    clearGraph();
+    // Layout: grid, ~sqrt(N) wide. Skip empty blocks.
+    const visibleBlocks = blockAgg.filter(b => b.fileCount > 0);
+    const cols = Math.max(1, Math.ceil(Math.sqrt(visibleBlocks.length * 1.2)));
+    const W = 320, H = 160;
+    visibleBlocks.forEach((b, k) => {
+      const node = LiteGraph.createNode("cm/block");
+      if (!node) return;
+      node.title = b.name + " (" + b.fileCount + ")";
+      node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
+      node.color = b.color;     // title bar
+      node.bgcolor = "#1f1f1f"; // body
+      node.cmBlock = b;
+      graph.add(node);
+      blockNodesById[b.bi] = node;
+    });
+    // Draw cross-block edges
+    for (const k in blockEdgeCounts) {
+      const [a, b] = k.split("->").map(Number);
+      const na = blockNodesById[a], nb = blockNodesById[b];
+      if (!na || !nb) continue;
+      na.connect(0, nb, 0);
+    }
+    currentMode = "summary";
+    detailFocusBlock = null;
+    setTimeout(fitView, 30);
+  }
+
+  function buildDetailGraph(focusBi) {
+    // focusBi = optional block index — restrict to that block's files
+    clearGraph();
+    const focused = (focusBi !== null && focusBi !== undefined);
+    const visibleFileIds = focused
+      ? new Set(blockAgg[focusBi].member_ids)
+      : null;
+
+    const { positions, blockBoxes } = layout(
+      data.nodes.filter(n => !visibleFileIds || visibleFileIds.has(n.id)),
+      blocksMeta
+    );
+    // Add LGraphGroups for visible blocks
+    for (const box of blockBoxes) {
+      if (box.bi >= blocksMeta.length) continue;
+      if (focused && box.bi !== focusBi) continue;
+      const blk = blocksMeta[box.bi];
+      const color = blk.is_tests
+        ? (data.test_cluster_color || "#888888")
+        : (data.cluster_colors[box.bi % data.cluster_colors.length] || "#4ec9b0");
+      const g = new LiteGraph.LGraphGroup();
+      g.title = blk.name || `Block ${box.bi}`;
+      g.pos = [box.x, box.y];
+      g.size = [box.w, box.h];
+      g.color = color;
+      graph.add(g);
+    }
+    // Add file nodes
+    for (const n of (data.nodes || [])) {
+      if (visibleFileIds && !visibleFileIds.has(n.id)) continue;
+      const node = LiteGraph.createNode("cm/file");
+      if (!node) continue;
+      node.title = n.name || "(unnamed)";
+      const pos = positions[n.id] || { x: 0, y: 0 };
+      node.pos = [pos.x, pos.y];
+      node.color = NODE_TYPE_COLORS[n.type] || "#3b6c8e";
+      node.bgcolor = "#2a2a2a";
+      node._origBgcolor = node.bgcolor;
+      node._origColor = node.color;
+      node.cmData = n;
+      graph.add(node);
+      nodesById[n.id] = node;
+    }
+    // Edges (only between visible nodes)
+    for (const e of (data.edges || [])) {
+      const a = nodesById[e.source], b = nodesById[e.target];
+      if (!a || !b) continue;
+      a.connect(0, b, 0);
+    }
+    currentMode = "detail";
+    detailFocusBlock = focused ? focusBi : null;
+    setTimeout(fitView, 30);
+  }
+
+  // ---------------- Logic Blocks side panel ----------------
+  // In summary mode: row click = drill into that block (detail mode focused)
+  // In detail mode (full): row click = collapse just that block's files
+  function buildBlocksPanel() {
+    const blocksList = document.getElementById("blocks-list");
+    blocksList.innerHTML = "";
+    for (const b of blockAgg) {
+      if (b.fileCount === 0) continue;
+      const row = document.createElement("div");
+      row.className = "block-row";
+
+      const swatch = document.createElement("span");
+      swatch.className = "swatch";
+      swatch.style.background = b.color;
+      row.appendChild(swatch);
+
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = b.name + " (" + b.fileCount + ")";
+      row.appendChild(name);
+
+      const tog = document.createElement("span");
+      tog.className = "toggle";
+      tog.textContent = "drill";
+      row.appendChild(tog);
+
+      row.addEventListener("click", () => {
+        // Drill into this block: detail mode, only its files
+        document.getElementById("viewMode").value = "detail";
+        buildDetailGraph(b.bi);
+      });
+      blocksList.appendChild(row);
+    }
+  }
+  buildBlocksPanel();
+
+  // ---------------- Initial build (summary mode) ----------------
   function fitView() {
     if (!graph._nodes.length) return;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -486,7 +582,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   window.addEventListener("resize", resize);
   resize();
-  fitView();
+
+  // Build the initial graph (default = summary mode)
+  buildSummaryGraph();
 
   // Highlight: dim non-neighbors, brighten selected + connected, mark
   // their links so LiteGraph draws them prominently.
@@ -540,6 +638,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (n && n.cmData) {
       renderSidebar(n.cmData);
       applyHighlight(n.cmData.id);
+    } else if (n && n.cmBlock) {
+      renderBlockSidebar(n.cmBlock);
     }
   };
   lgcanvas.onNodeDeselected = function() {
@@ -569,29 +669,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       lgcanvas.setDirty(true, true);
     },
     setView: function(mode) {
-      // Summary mode: hide all file nodes, leave groups visible
-      const hide = (mode === "summary");
-      for (const node of graph._nodes) {
-        if (!node.cmData) continue;
-        const isCollapsed = !!(node.flags && node.flags.collapsed);
-        if (isCollapsed !== hide && typeof node.collapse === "function") {
-          node.collapse();
-        }
-      }
-      // Sync the blocks panel UI to match
-      for (const r of blockUiRows) {
-        blockState[r.bi] = hide;
-        r.row.classList.toggle("hidden", hide);
-        r.tog.textContent = hide ? "show" : "hide";
-      }
-      lgcanvas.setDirty(true, true);
-      if (typeof lgcanvas.draw === "function") lgcanvas.draw(true, true);
-      fitView();
+      if (mode === "summary") buildSummaryGraph();
+      else buildDetailGraph(null);
     },
-    allBlocks: function(hide) {
-      for (const r of blockUiRows) {
-        setBlockHidden(r.bi, hide, r.row, r.tog, r.box);
-      }
+    drillBack: function() {
+      // Return to summary from a focused detail view
+      document.getElementById("viewMode").value = "summary";
+      buildSummaryGraph();
     },
   };
 
@@ -650,6 +734,47 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
   }
 
+  // Block-summary sidebar — fires when a CMBlockNode is clicked
+  function renderBlockSidebar(b) {
+    const el = document.getElementById("sidebar-content");
+    const c = b.counts || {};
+    const lines = [
+      `<h2>${escapeHtml(b.name)}</h2>`,
+      `<div class="meta-row"><b>Files:</b> ${b.fileCount}</div>`,
+      `<div class="meta-row"><b>Total complexity:</b> ${b.totalCx}</div>`,
+    ];
+    if (c.high || c.med || c.low) {
+      lines.push(`<div class="meta-row"><b>Findings:</b> ` +
+        (c.high ? `<span style="color:#f48771">${c.high}H</span> ` : "") +
+        (c.med ? `<span style="color:#dcdcaa">${c.med}M</span> ` : "") +
+        (c.low ? `<span style="color:#888">${c.low}L</span>` : "") +
+        `</div>`);
+    }
+    lines.push(`<button class="panel-btn" style="margin-top:10px;" ` +
+      `onclick="window.cm.setView('detail');setTimeout(()=>{` +
+      `document.getElementById('viewMode').value='detail';` +
+      `},10);" data-bi="${b.bi}">Drill into this block</button>`);
+    lines.push(`<h2 style="margin-top:14px;">Files (${b.fileCount})</h2>`);
+    for (const id of (b.member_ids || [])) {
+      const f = fileById[id]; if (!f) continue;
+      const fnds = findingsByFile[f.path] || [];
+      const cnt = fnds.length ? ` <span style="color:#888">(${fnds.length})</span>` : "";
+      lines.push(`<div class="finding low">` +
+        `<span class="rule">${escapeHtml(f.name)}</span>${cnt}<br>` +
+        `<span class="desc" style="color:#666">${escapeHtml(f.path || "")}</span></div>`);
+    }
+    el.innerHTML = lines.join("");
+    // Wire the drill-in button to also focus on this block
+    const btn = el.querySelector("button[data-bi]");
+    if (btn) {
+      btn.addEventListener("click", function(ev) {
+        ev.stopPropagation();
+        document.getElementById("viewMode").value = "detail";
+        buildDetailGraph(b.bi);
+      });
+    }
+  }
+
   function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c =>
       ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -675,11 +800,51 @@ def _is_test_file(node: dict) -> bool:
     return False
 
 
+def _top_dir(path: str) -> str:
+    """First non-empty directory segment, normalized."""
+    p = (path or "").replace("\\", "/")
+    if "/" not in p:
+        return "(root)"
+    parts = [s for s in p.split("/") if s]
+    return parts[0] if parts else "(root)"
+
+
+def _split_oversized_block(name: str, node_ids: list,
+                           id_to_path: dict, max_files: int) -> list:
+    """If a block has > max_files, split by top-level directory."""
+    if len(node_ids) <= max_files:
+        return [{"name": name, "node_ids": node_ids}]
+
+    by_dir: dict[str, list] = {}
+    for nid in node_ids:
+        d = _top_dir(id_to_path.get(nid, ""))
+        by_dir.setdefault(d, []).append(nid)
+    # Singletons collapse into "(misc)"
+    misc: list = []
+    out: list = []
+    for d, ids in by_dir.items():
+        if len(ids) < 2:
+            misc.extend(ids)
+        else:
+            out.append({"name": f"{name} / {d}", "node_ids": ids})
+    if misc:
+        out.append({"name": f"{name} / (misc)", "node_ids": misc})
+    # Sort largest first so summary nodes lay out predictably
+    out.sort(key=lambda b: -len(b["node_ids"]))
+    return out
+
+
 def _build_logic_blocks(repo_map: RepoMap, valid_ids: set,
                         nodes_data: list) -> list:
-    """Synthetic Tests cluster + filtered logic_blocks from repo_map."""
+    """Synthetic Tests cluster + filtered logic_blocks from repo_map.
+
+    Big buckets (e.g. 'Utilities / Standalone' with 381 files in FRed)
+    get split by top-level directory so no single block dominates.
+    """
+    SPLIT_THRESHOLD = 50
     test_ids = [n["id"] for n in nodes_data if _is_test_file(n)]
     test_id_set = set(test_ids)
+    id_to_path = {n["id"]: n.get("path", "") for n in nodes_data}
 
     blocks = []
     if test_ids:
@@ -690,7 +855,11 @@ def _build_logic_blocks(repo_map: RepoMap, valid_ids: set,
                        if nid in valid_ids and nid not in test_id_set]
         if len(block_files) < 2:
             continue
-        blocks.append({"name": blk.name or "", "node_ids": block_files})
+        # Split mega-blocks by top-level dir
+        for sub in _split_oversized_block(
+            blk.name or "Block", block_files, id_to_path, SPLIT_THRESHOLD
+        ):
+            blocks.append(sub)
     return blocks
 
 
