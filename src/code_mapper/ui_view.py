@@ -190,9 +190,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     return;
   }
 
-  // Title text color — black for summary block bars (bright cluster
-  // colors). buildDetailGraph swaps to white for file nodes (dark
-  // type-colored title bars where black would be unreadable).
+  // Title text color — black for the bright cluster-colored title
+  // bars. LiteGraph 0.7.18 uses several constants for title text
+  // depending on the code path (NODE_TITLE_COLOR for the main draw,
+  // NODE_TITLE_TEXT_COLOR + NODE_SELECTED_TITLE_COLOR for variants).
+  // Set all of them so no path falls back to a non-black default.
+  LiteGraph.NODE_TITLE_COLOR = "#000";
   LiteGraph.NODE_TITLE_TEXT_COLOR = "#000";
   LiteGraph.NODE_SELECTED_TITLE_COLOR = "#000";
 
@@ -838,7 +841,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
   }
 
-  graph.start();  // begin render loop
+  // No graph.start() — that runs LiteGraph's *execution* loop, which
+  // marks connected nodes as 'executing' and re-tints their titles
+  // with the running-state color (gives the title text a red/maroon
+  // tint over its normal color). We only need rendering, which
+  // LGraphCanvas drives on its own. Skip execution entirely.
 })();
 </script>
 </body></html>
