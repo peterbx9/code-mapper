@@ -555,7 +555,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       data.nodes.filter(n => !visibleFileIds || visibleFileIds.has(n.id)),
       blocksMeta
     );
-    // Add LGraphGroups for visible blocks
+    // Add LGraphGroups for visible blocks. Tagged with member ids so
+    // they can auto-resize to wrap their nodes after drags.
     for (const box of blockBoxes) {
       if (box.bi >= blocksMeta.length) continue;
       if (focused && box.bi !== focusBi) continue;
@@ -568,6 +569,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       g.pos = [box.x, box.y];
       g.size = [box.w, box.h];
       g.color = color;
+      g._cmMemberIds = new Set(blk.node_ids || []);
       graph.add(g);
     }
     // Add file nodes
@@ -600,7 +602,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
     currentMode = "detail";
     detailFocusBlock = focused ? focusBi : null;
-    setTimeout(fitView, 30);
+    setTimeout(() => { if (typeof reflowGroups === "function") reflowGroups(); fitView(); }, 30);
   }
 
   // ---------------- Logic Blocks side panel ----------------
@@ -705,12 +707,41 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   window.addEventListener("resize", resize);
   resize();
 
+  // Recompute each LGraphGroup's bounding box to wrap its member nodes
+  // wherever they currently are. Adds padding + room for the title bar.
+  function reflowGroups() {
+    if (!graph._groups || !graph._groups.length) return;
+    const PAD = 30;
+    const TITLE = 30;
+    for (const g of graph._groups) {
+      const members = g._cmMemberIds;
+      if (!members) continue;
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      let hits = 0;
+      for (const node of graph._nodes) {
+        if (!node.cmData || !members.has(node.cmData.id)) continue;
+        const x = node.pos[0], y = node.pos[1];
+        const w = node.size[0], h = node.size[1];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x + w > maxX) maxX = x + w;
+        if (y + h > maxY) maxY = y + h;
+        hits++;
+      }
+      if (hits === 0) continue;
+      g.pos = [minX - PAD, minY - PAD - TITLE];
+      g.size = [maxX - minX + PAD * 2, maxY - minY + PAD * 2 + TITLE];
+    }
+    lgcanvas.setDirty(true, true);
+  }
+
   // Persist layout on node drag-release. LiteGraph fires onNodeMoved
   // after a drag, but we also catch general mouseup as a fallback.
   lgcanvas.onNodeMoved = function(node) {
     if (!node || !node._cmId) return;
     savedLayout[node._cmId] = [node.pos[0], node.pos[1]];
     _persistLayout();
+    reflowGroups();
   };
   // Belt-and-braces: snapshot positions on every mouseup. Cheap enough.
   document.getElementById("graph-canvas").addEventListener("mouseup", () => {
@@ -724,6 +755,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     }
     if (dirty) _persistLayout();
+    reflowGroups();
   });
 
   // Build the initial graph (default = summary mode)
