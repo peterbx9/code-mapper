@@ -384,12 +384,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     for (const memberData of box.bucket) {
       const node = nodesById[memberData.id];
       if (!node) continue;
-      node.flags = node.flags || {};
-      node.flags.collapsed = !!hidden;
+      const isCollapsed = !!(node.flags && node.flags.collapsed);
+      // node.collapse() is a toggle in LiteGraph — only call when state
+      // actually needs to flip, otherwise we'll bounce back.
+      if (isCollapsed !== !!hidden && typeof node.collapse === "function") {
+        node.collapse();
+      } else {
+        node.flags = node.flags || {};
+        node.flags.collapsed = !!hidden;
+      }
     }
     if (row) row.classList.toggle("hidden", !!hidden);
     if (tog) tog.textContent = hidden ? "show" : "hide";
     lgcanvas.setDirty(true, true);
+    if (typeof lgcanvas.draw === "function") lgcanvas.draw(true, true);
   }
 
   const blockUiRows = [];  // [{bi, row, tog, box}]
@@ -552,9 +560,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       // Summary mode: hide all file nodes, leave groups visible
       const hide = (mode === "summary");
       for (const node of graph._nodes) {
-        if (node.cmData) {
-          node.flags = node.flags || {};
-          node.flags.collapsed = hide;
+        if (!node.cmData) continue;
+        const isCollapsed = !!(node.flags && node.flags.collapsed);
+        if (isCollapsed !== hide && typeof node.collapse === "function") {
+          node.collapse();
         }
       }
       // Sync the blocks panel UI to match
@@ -564,6 +573,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         r.tog.textContent = hide ? "show" : "hide";
       }
       lgcanvas.setDirty(true, true);
+      if (typeof lgcanvas.draw === "function") lgcanvas.draw(true, true);
       fitView();
     },
     allBlocks: function(hide) {
