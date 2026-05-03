@@ -351,6 +351,12 @@ def main():
         help="Render a D3 force-directed graph view. Default: repo-map-graph.html",
     )
     parser.add_argument(
+        "--ui", nargs="?", const="repo-map-ui.html", default=None,
+        metavar="OUT",
+        help="Render a React Flow node-graph UI (ComfyUI-style). Self-contained "
+             "HTML, no install. Default: repo-map-ui.html",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Used with --fix to preview changes without writing files.",
     )
@@ -472,6 +478,12 @@ def main():
         out_g = Path(args.graph) if Path(args.graph).is_absolute() else (project_root / args.graph)
         write_graph_html(repo_map, out_g, str(project_root))
         print(f"Graph view: {out_g}")
+
+    if args.ui is not None:
+        from .ui_view import write_ui_html
+        out_ui = Path(args.ui) if Path(args.ui).is_absolute() else (project_root / args.ui)
+        write_ui_html(repo_map, out_ui, str(project_root))
+        print(f"React Flow UI: {out_ui}")
 
     fail_exit = _exit_code_for_findings(repo_map, args.fail_on)
     return diff_exit or fail_exit
