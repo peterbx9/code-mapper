@@ -483,7 +483,7 @@ def main():
         from .ui_view import write_ui_html
         out_ui = Path(args.ui) if Path(args.ui).is_absolute() else (project_root / args.ui)
         write_ui_html(repo_map, out_ui, str(project_root))
-        print(f"React Flow UI: {out_ui}")
+        print(f"LiteGraph UI: {out_ui}")
 
     fail_exit = _exit_code_for_findings(repo_map, args.fail_on)
     return diff_exit or fail_exit
