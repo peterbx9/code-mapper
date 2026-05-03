@@ -328,6 +328,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   CMBlockNode.prototype.onDrawForeground = function(ctx) {
     if (!this.cmBlock) return;
     const b = this.cmBlock;
+    // Draw our own title in black on top of the (now-blank) title bar.
+    // y is negative because the title bar sits above the body origin.
+    const titleH = LiteGraph.NODE_TITLE_HEIGHT || 30;
+    ctx.save();
+    ctx.fillStyle = "#000";
+    ctx.font = "bold 14px -apple-system, Segoe UI, sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillText(String(b.displayTitle || ""), 12, -titleH / 2);
+    ctx.restore();
     ctx.fillStyle = "#fff";
     ctx.font = "bold 13px -apple-system, Segoe UI, sans-serif";
     ctx.fillText(b.fileCount + " files", 12, 36);
@@ -354,21 +363,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   };
   CMBlockNode.prototype.onSelected = function() {
     if (this.cmBlock) renderBlockSidebar(this.cmBlock);
-  };
-  // Draw our own title text in BLACK on the bright title bar.
-  // LiteGraph hands us a ctx already translated so y=0 is the node's
-  // body top; the title bar lives at -titleHeight..0.
-  CMBlockNode.prototype.onDrawTitleText = function(
-    ctx, titleHeight, size, scale, fontSize
-  ) {
-    if (this.flags && this.flags.collapsed) return;
-    ctx.save();
-    ctx.fillStyle = "#000";
-    ctx.font = "bold " + (fontSize || 14) + "px -apple-system, Segoe UI, sans-serif";
-    ctx.textAlign = "left";
-    ctx.textBaseline = "middle";
-    ctx.fillText(String(this.title || ""), 10, -titleHeight * 0.5);
-    ctx.restore();
   };
   LiteGraph.registerNodeType("cm/block", CMBlockNode);
 
@@ -465,11 +459,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     visibleBlocks.forEach((b, k) => {
       const node = LiteGraph.createNode("cm/block");
       if (!node) return;
-      node.title = b.name + " (" + b.fileCount + ")";
+      // Blank LiteGraph's own title text — we draw our own in
+      // onDrawForeground in pure black. Stash the display string on
+      // cmBlock so onDrawForeground can read it.
+      b.displayTitle = b.name + " (" + b.fileCount + ")";
+      node.title = "";
       node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
       node.color = b.color;     // title bar
       node.bgcolor = "#1f1f1f"; // body
-      node._titleTextColor = "#000";  // black title on bright bar
       node.cmBlock = b;
       graph.add(node);
       blockNodesById[b.bi] = node;
