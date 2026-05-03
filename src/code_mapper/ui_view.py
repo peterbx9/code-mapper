@@ -478,7 +478,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       node.title = b.name + " (" + b.fileCount + ")";
       node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
       node.color = b.color;     // title bar
-      node.bgcolor = "#1f1f1f"; // body
+      node.bgcolor = "#3a3a3a"; // body — dark gray (was near-black)
       node.cmBlock = b;
       graph.add(node);
       blockNodesById[b.bi] = node;
