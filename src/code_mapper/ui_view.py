@@ -123,12 +123,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                           padding: 0 5px; background: #333; color: #888;
                           border-radius: 2px; cursor: pointer; font-size: 10px; }
   .cm-node .expand-btn:hover { background: #444; color: #ccc; }
+  /* Summary-mode big block card (one per logic block) */
+  .cm-block { min-width: 240px; padding: 14px 18px;
+              border: 2px solid rgba(255,255,255,0.4);
+              border-radius: 10px; cursor: pointer;
+              box-shadow: 0 4px 16px rgba(0,0,0,0.45),
+                          inset 0 0 32px rgba(0,0,0,0.25);
+              transition: transform 80ms, box-shadow 80ms; }
+  .cm-block:hover { transform: translateY(-1px);
+                    box-shadow: 0 6px 22px rgba(0,0,0,0.55),
+                                inset 0 0 32px rgba(0,0,0,0.25); }
+  .cm-block.selected { border-color: #4ec9b0; }
+  .cm-block .block-title { font-size: 18px; font-weight: 700; color: #fff;
+                           letter-spacing: 0.6px; text-transform: uppercase;
+                           text-shadow: 0 1px 3px rgba(0,0,0,0.7);
+                           margin-bottom: 6px; }
+  .cm-block .block-stat { font-size: 12px; color: rgba(255,255,255,0.85);
+                          margin-bottom: 4px; }
+  .cm-block .block-findings { font-size: 12px; font-weight: 600;
+                              color: rgba(255,255,255,0.85); }
+  .cm-block .block-findings .lint-high { color: #f48771; }
+  .cm-block .block-findings .lint-med { color: #dcdcaa; }
 </style>
 </head><body>
 <header>
   <h1>Code Mapper</h1>
   <span class="meta">__PROJECT__ · __N_NODES__ nodes · __N_EDGES__ edges · __N_FINDINGS__ findings</span>
   <input id="filter" placeholder="Filter (file, function, rule)..." oninput="window.cm.applyFilter(this.value)">
+  <select id="viewMode" onchange="window.cm.setView(this.value)">
+    <option value="summary">Summary (logic blocks)</option>
+    <option value="detail">Detail (all files)</option>
+  </select>
   <select id="layoutMode" onchange="window.cm.setLayout(this.value)">
     <option value="force">Force layout</option>
     <option value="hierarchical">Hierarchical</option>
@@ -233,6 +258,32 @@ function CMCluster(props) {
   );
 }
 
+// CMBlock — Summary-mode interactive block. Big colored card per logic
+// block showing name + file count + finding totals + total complexity.
+function CMBlock(props) {
+  const nd = props.data || {};
+  const selected = !!props.selected;
+  const counts = nd.counts || {};
+  const findingKids = [];
+  if (counts.high) findingKids.push(h("span", { key: "h", className: "lint-high" }, counts.high + "H"));
+  if (counts.med) findingKids.push(h("span", { key: "m", className: "lint-med" }, " " + counts.med + "M"));
+  if (counts.low) findingKids.push(h("span", { key: "l" }, " " + counts.low + "L"));
+  return h("div", {
+    className: "cm-block " + (selected ? "selected" : ""),
+    style: {
+      background: String(nd.color || "rgba(78,201,176,0.22)"),
+      borderColor: String(nd.borderColor || "rgba(255,255,255,0.4)"),
+    },
+  },
+    h(Handle, { type: "target", position: Position.Left, style: { background: "#888" } }),
+    h("div", { key: "ttl", className: "block-title" }, String(nd.label || "Block")),
+    h("div", { key: "stat", className: "block-stat" },
+      String(nd.fileCount || 0) + " files · cx " + String(nd.totalCx || 0)),
+    findingKids.length > 0 ? h("div", { key: "fnd", className: "block-findings" }, findingKids) : null,
+    h(Handle, { type: "source", position: Position.Right, style: { background: "#888" } })
+  );
+}
+
 // Force-layout positions (approximate; React Flow stores as-is)
 function forceLayout(nodes, edges) {
   const n = nodes.length;
@@ -303,6 +354,83 @@ function computeClusterBBoxes(nodes, blocks) {
   return out;
 }
 
+// Build SUMMARY-mode payload: one big block per logic_block, edges
+// aggregated cluster→cluster (cross-cluster file refs collapsed).
+function buildSummaryGraph(fileNodes, fileEdges, blocks) {
+  const fileToBlock = {};
+  const blockMeta = blocks.map((blk, i) => {
+    const ids = blk.node_ids || [];
+    for (const id of ids) fileToBlock[id] = i;
+    return {
+      i, blk, fileCount: ids.length,
+      totalCx: 0, counts: { high: 0, med: 0, low: 0 },
+    };
+  });
+  // Aggregate complexity + findings per block
+  for (const fn of fileNodes) {
+    const bi = fileToBlock[fn.id];
+    if (bi === undefined) continue;
+    const meta = blockMeta[bi];
+    meta.totalCx += (fn.data.complexity || 0);
+    const findings = findingsByFile[fn.data.path] || [];
+    for (const f of findings) {
+      const sev = String(f.severity || "low").toLowerCase();
+      if (sev === "high") meta.counts.high++;
+      else if (sev === "med") meta.counts.med++;
+      else meta.counts.low++;
+    }
+  }
+  // Grid layout: ~sqrt(N) wide, large gaps so blocks read at zoom-out
+  const N = blockMeta.length;
+  const cols = Math.max(1, Math.ceil(Math.sqrt(N * 1.4)));
+  const W = 320, H = 160;  // cell size including gap
+  const summaryNodes = blockMeta.map((meta, k) => {
+    const blk = meta.blk;
+    const color = blk.is_tests
+      ? (data.test_cluster_color || "rgba(180,180,180,0.32)")
+      : data.cluster_colors[k % data.cluster_colors.length];
+    // Boost saturation for the block fill (separate from cluster region)
+    const fill = String(color).replace(/0\.\d+\)$/, "0.55)");
+    const border = String(color).replace(/0\.\d+\)$/, "1.0)");
+    return {
+      id: `block-${meta.i}`,
+      type: "block",
+      position: { x: (k % cols) * W, y: Math.floor(k / cols) * H },
+      data: {
+        label: blk.name || `Block ${meta.i}`,
+        fileCount: meta.fileCount,
+        totalCx: meta.totalCx,
+        counts: meta.counts,
+        color: fill,
+        borderColor: border,
+        block_index: meta.i,
+        is_tests: !!blk.is_tests,
+        member_ids: blk.node_ids || [],
+      },
+    };
+  });
+  // Aggregate cluster→cluster edges with weights
+  const edgeKey = {};
+  for (const e of fileEdges) {
+    const a = fileToBlock[e.source], b = fileToBlock[e.target];
+    if (a === undefined || b === undefined || a === b) continue;
+    const k = `${a}->${b}`;
+    edgeKey[k] = (edgeKey[k] || 0) + 1;
+  }
+  const summaryEdges = Object.entries(edgeKey).map(([k, w]) => {
+    const [a, b] = k.split("->").map(Number);
+    return {
+      id: `se-${k}`, source: `block-${a}`, target: `block-${b}`,
+      type: "default", animated: false,
+      style: { stroke: "#888", strokeWidth: Math.min(6, 1 + Math.log2(w)),
+               opacity: 0.6 },
+      label: w > 1 ? String(w) : "",
+      data: { weight: w },
+    };
+  });
+  return { summaryNodes, summaryEdges };
+}
+
 function App() {
   const initialNodes = data.nodes.map(n => ({
     id: n.id,
@@ -322,18 +450,29 @@ function App() {
   );
   const laid = useMemo(() => forceLayout(initialNodes, initialEdges), []);
   const clusters = useMemo(() => computeClusterBBoxes(laid, data.logic_blocks || []), [laid]);
-  const [nodes, setNodes] = useState([...clusters, ...laid]);
-  const [edges, setEdges] = useState(initialEdges);
+  const summary = useMemo(
+    () => buildSummaryGraph(laid, initialEdges, data.logic_blocks || []),
+    [laid]
+  );
+
+  const [viewMode, setViewMode] = useState("summary");  // default to summary
+  const detailNodes = useMemo(() => [...clusters, ...laid], [clusters, laid]);
+  const [nodes, setNodes] = useState(summary.summaryNodes);
+  const [edges, setEdges] = useState(summary.summaryEdges);
   const [selected, setSelected] = useState(null);
 
   const onNodesChange = useCallback((changes) => setNodes(ns => applyNodeChanges(changes, ns)), []);
   const onEdgesChange = useCallback((changes) => setEdges(es => applyEdgeChanges(changes, es)), []);
   const onNodeClick = useCallback((_, node) => {
     setSelected(node);
-    renderSidebar(node);
+    if (node.type === "block") {
+      renderBlockSidebar(node);
+    } else {
+      renderSidebar(node);
+    }
   }, []);
 
-  // Expose filter + layout switch on window
+  // Expose filter + layout + view switch on window
   useEffect(() => {
     window.cm = window.cm || {};
     window.cm.applyFilter = (q) => {
@@ -341,32 +480,52 @@ function App() {
       setNodes(ns => ns.map(n => ({
         ...n,
         hidden: q && !(n.data.path || "").toLowerCase().includes(q)
-                  && !(n.data.name || "").toLowerCase().includes(q),
+                  && !(n.data.label || n.data.name || "").toLowerCase().includes(q),
       })));
     };
     window.cm.setLayout = (mode) => {
+      if (viewMode !== "detail") return;  // layout switching only meaningful in detail
       setNodes(ns => {
         const fileNodes = ns.filter(n => n.type === "cm");
-        const laid = mode === "hierarchical"
+        const laid2 = mode === "hierarchical"
           ? hierarchicalLayout(fileNodes, edges)
           : forceLayout(fileNodes, edges);
-        const newClusters = computeClusterBBoxes(laid, data.logic_blocks || []);
-        return [...newClusters, ...laid];
+        const newClusters = computeClusterBBoxes(laid2, data.logic_blocks || []);
+        return [...newClusters, ...laid2];
       });
     };
-  }, [edges]);
+    window.cm.setView = (mode) => {
+      setViewMode(mode);
+      if (mode === "summary") {
+        setNodes(summary.summaryNodes);
+        setEdges(summary.summaryEdges);
+      } else {
+        setNodes(detailNodes);
+        setEdges(initialEdges);
+      }
+    };
+  }, [edges, viewMode, summary, detailNodes]);
+
+  const nodeTypes = useMemo(
+    () => ({ cm: CMNode, cluster: CMCluster, block: CMBlock }),
+    []
+  );
 
   return React.createElement(ReactFlow, {
-    nodes, edges, nodeTypes: { cm: CMNode, cluster: CMCluster },
+    nodes, edges, nodeTypes,
     onNodesChange, onEdgesChange, onNodeClick,
-    fitView: true, fitViewOptions: { padding: 0.12, includeHiddenNodes: false },
+    fitView: true, fitViewOptions: { padding: 0.18, includeHiddenNodes: false },
     minZoom: 0.03, maxZoom: 4,
     style: { background: "#1a1a1a" },
   },
     React.createElement(Background, { color: "#333", gap: 20, size: 1 }),
     React.createElement(Controls, { style: { left: 12, bottom: 12 } }),
     React.createElement(MiniMap, {
-      nodeColor: (n) => ({ file: "#9cdcfe", class: "#c586c0", function: "#dcdcaa" }[n.data?.type] || "#666"),
+      nodeColor: (n) => {
+        if (n.type === "block") return n.data?.borderColor || "#888";
+        if (n.type === "cluster") return "transparent";
+        return ({ file: "#9cdcfe", class: "#c586c0", function: "#dcdcaa" }[n.data?.type] || "#666");
+      },
       style: { background: "#1a1a1a", border: "1px solid #444" },
     })
   );
@@ -394,6 +553,38 @@ function renderSidebar(node) {
       `<span class="desc">${escapeHtml((f.desc || "").slice(0, 200))}</span>` +
       `</div>`
     );
+  }
+  el.innerHTML = lines.join("");
+}
+
+function renderBlockSidebar(node) {
+  const el = document.getElementById("sidebar-content");
+  const nd = node.data || {};
+  const memberIds = nd.member_ids || [];
+  const fileById = {};
+  for (const f of (data.nodes || [])) fileById[f.id] = f;
+  const lines = [
+    `<h2>${escapeHtml(nd.label || "Block")}</h2>`,
+    `<div class="meta-row"><b>Files:</b> ${nd.fileCount || 0}</div>`,
+    `<div class="meta-row"><b>Total complexity:</b> ${nd.totalCx || 0}</div>`,
+  ];
+  const c = nd.counts || {};
+  if (c.high || c.med || c.low) {
+    lines.push(`<div class="meta-row"><b>Findings:</b> ` +
+      (c.high ? `<span style="color:#f48771">${c.high}H</span> ` : "") +
+      (c.med ? `<span style="color:#dcdcaa">${c.med}M</span> ` : "") +
+      (c.low ? `<span style="color:#888">${c.low}L</span>` : "") +
+      `</div>`);
+  }
+  lines.push(`<h2 style="margin-top:14px;">Files in this block</h2>`);
+  for (const id of memberIds) {
+    const f = fileById[id];
+    if (!f) continue;
+    const fnds = findingsByFile[f.path] || [];
+    const cnt = fnds.length ? ` <span style="color:#888">(${fnds.length})</span>` : "";
+    lines.push(`<div class="finding low">` +
+      `<span class="rule">${escapeHtml(f.name)}</span>${cnt}<br>` +
+      `<span class="desc" style="color:#666">${escapeHtml(f.path || "")}</span></div>`);
   }
   el.innerHTML = lines.join("");
 }
