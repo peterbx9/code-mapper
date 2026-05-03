@@ -145,6 +145,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <option value="detail">Detail (all files)</option>
   </select>
   <button onclick="window.cm.fitView()">Fit</button>
+  <button onclick="window.cm.resetLayout()" title="Discard saved positions">Reset Layout</button>
   <button onclick="document.getElementById('sidebar').classList.toggle('collapsed')">
     Toggle Sidebar
   </button>
@@ -188,6 +189,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     document.getElementById("error-box").innerHTML =
       "<b>LiteGraph not loaded.</b> Check network — jsdelivr.net blocked?";
     return;
+  }
+
+  // ---------------- Persisted layout (localStorage) ----------------
+  // One key per project path. Stores { nodeId: [x, y] } for nodes the
+  // user has dragged. On graph build we apply saved positions over the
+  // grid-computed defaults; on drag-release we update the entry.
+  const LAYOUT_KEY = "cm.layout." + (data.project_path || "default");
+  let savedLayout = {};
+  try {
+    const raw = localStorage.getItem(LAYOUT_KEY);
+    if (raw) savedLayout = JSON.parse(raw) || {};
+  } catch (e) { savedLayout = {}; }
+
+  function _persistLayout() {
+    try { localStorage.setItem(LAYOUT_KEY, JSON.stringify(savedLayout)); }
+    catch (e) { /* quota / private mode — best-effort */ }
   }
 
   // Title text color — black for the bright cluster-colored title
@@ -502,10 +519,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const node = LiteGraph.createNode("cm/block");
       if (!node) return;
       node.title = b.name + " (" + b.fileCount + ")";
-      node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
+      const id = "block-" + b.bi;
+      const saved = savedLayout[id];
+      node.pos = saved
+        ? [saved[0], saved[1]]
+        : [(k % cols) * W, Math.floor(k / cols) * H];
       node.color = b.color;     // title bar
       node.bgcolor = "#3a3a3a"; // body — dark gray (was near-black)
       node.cmBlock = b;
+      node._cmId = id;
       graph.add(node);
       blockNodesById[b.bi] = node;
     });
@@ -554,13 +576,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const node = LiteGraph.createNode("cm/file");
       if (!node) continue;
       node.title = n.name || "(unnamed)";
-      const pos = positions[n.id] || { x: 0, y: 0 };
-      node.pos = [pos.x, pos.y];
+      const saved = savedLayout[n.id];
+      if (saved) {
+        node.pos = [saved[0], saved[1]];
+      } else {
+        const pos = positions[n.id] || { x: 0, y: 0 };
+        node.pos = [pos.x, pos.y];
+      }
       node.color = NODE_TYPE_BG_BRIGHT[n.type] || NODE_TYPE_COLORS[n.type] || "#7ab8e0";
       node.bgcolor = "#2a2a2a";
       node._origBgcolor = node.bgcolor;
       node._origColor = node.color;
       node.cmData = n;
+      node._cmId = n.id;
       graph.add(node);
       nodesById[n.id] = node;
     }
@@ -677,6 +705,27 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   window.addEventListener("resize", resize);
   resize();
 
+  // Persist layout on node drag-release. LiteGraph fires onNodeMoved
+  // after a drag, but we also catch general mouseup as a fallback.
+  lgcanvas.onNodeMoved = function(node) {
+    if (!node || !node._cmId) return;
+    savedLayout[node._cmId] = [node.pos[0], node.pos[1]];
+    _persistLayout();
+  };
+  // Belt-and-braces: snapshot positions on every mouseup. Cheap enough.
+  document.getElementById("graph-canvas").addEventListener("mouseup", () => {
+    let dirty = false;
+    for (const n of graph._nodes) {
+      if (!n._cmId) continue;
+      const cur = savedLayout[n._cmId];
+      if (!cur || cur[0] !== n.pos[0] || cur[1] !== n.pos[1]) {
+        savedLayout[n._cmId] = [n.pos[0], n.pos[1]];
+        dirty = true;
+      }
+    }
+    if (dirty) _persistLayout();
+  });
+
   // Build the initial graph (default = summary mode)
   buildSummaryGraph();
 
@@ -770,6 +819,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       // Return to summary from a focused detail view
       document.getElementById("viewMode").value = "summary";
       buildSummaryGraph();
+    },
+    resetLayout: function() {
+      if (!confirm("Discard saved card positions and return to default layout?")) return;
+      savedLayout = {};
+      try { localStorage.removeItem(LAYOUT_KEY); } catch (e) {}
+      // Rebuild the current view to apply default grid positions
+      const mode = document.getElementById("viewMode").value;
+      if (mode === "summary") buildSummaryGraph();
+      else buildDetailGraph(detailFocusBlock);
     },
   };
 
@@ -999,6 +1057,7 @@ def render_ui(repo_map: RepoMap, project_path: str = "") -> str:
         "logic_blocks": logic_blocks,
         "cluster_colors": CLUSTER_COLORS,
         "test_cluster_color": TEST_CLUSTER_COLOR,
+        "project_path": project_path or "",
     })
     return (HTML_TEMPLATE
             .replace("__PROJECT__", html.escape(project_path or "(unknown)"))
