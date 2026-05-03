@@ -89,6 +89,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   #sidebar .finding.low  { border-left-color: #555; }
   #sidebar .finding .rule { font-weight: 600; color: #9cdcfe; }
   #sidebar .finding .desc { color: #aaa; }
+  #sidebar .conn { margin: 4px 0; padding: 6px 8px; border-radius: 3px;
+                   font-size: 11px; background: #2a2a2a;
+                   border-left: 3px solid #4ec9b0; cursor: pointer; }
+  #sidebar .conn:hover { background: #353535; border-left-color: #6fe0c4; }
+  #sidebar .conn .rule { font-weight: 600; color: #9cdcfe; }
+  #sidebar .conn .etype { color: #888; font-size: 10px; padding-left: 6px; }
+  #sidebar .conn .desc { color: #666; font-size: 10px; }
+  #sidebar .empty { color: #666; font-style: italic; font-size: 11px; }
   #error-box { display: none; position: fixed; top: 60px; left: 20px;
                right: 340px; padding: 16px 20px; background: #2a1010;
                border: 1px solid #f48771; color: #f48771;
@@ -301,11 +309,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     graph.add(node);
     nodesById[n.id] = node;
   }
-  // Connect edges (file → file imports/calls)
+  // Connect edges (file → file imports/calls) and build adjacency map
+  const adjacency = {};
+  const fileById = {};
+  for (const fn of (data.nodes || [])) fileById[fn.id] = fn;
+  for (const id of Object.keys(nodesById)) {
+    adjacency[id] = { imports: [], importedBy: [] };
+  }
   for (const e of (data.edges || [])) {
     const a = nodesById[e.source], b = nodesById[e.target];
     if (!a || !b) continue;
     a.connect(0, b, 0);
+    adjacency[e.source].imports.push({ id: e.target, type: e.edge_type });
+    adjacency[e.target].importedBy.push({ id: e.source, type: e.edge_type });
+  }
+
+  // Snapshot original colors so we can restore after highlight dims
+  for (const node of graph._nodes) {
+    if (!node.cmData) continue;
+    node._origBgcolor = node.bgcolor;
+    node._origColor = node.color;
   }
 
   // Initial fit
@@ -350,13 +373,64 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   resize();
   fitView();
 
-  // Selection → sidebar (LiteGraph fires onNodeSelected on the canvas)
+  // Highlight: dim non-neighbors, brighten selected + connected, mark
+  // their links so LiteGraph draws them prominently.
+  const DIM_BG = "#161616", DIM_TITLE = "#3a3a3a";
+  const SEL_BG = "#3a3a3a";  // brightened body for selected node
+
+  function applyHighlight(selectedId) {
+    if (!selectedId) {
+      for (const node of graph._nodes) {
+        if (!node.cmData) continue;
+        node.bgcolor = node._origBgcolor;
+        node.color = node._origColor;
+      }
+      lgcanvas.highlighted_links = {};
+      lgcanvas.setDirty(true, true);
+      return;
+    }
+    const adj = adjacency[selectedId] || { imports: [], importedBy: [] };
+    const neighbors = new Set([selectedId]);
+    for (const x of adj.imports) neighbors.add(x.id);
+    for (const x of adj.importedBy) neighbors.add(x.id);
+    for (const node of graph._nodes) {
+      if (!node.cmData) continue;
+      if (node.cmData.id === selectedId) {
+        node.bgcolor = SEL_BG;
+        node.color = node._origColor;
+      } else if (neighbors.has(node.cmData.id)) {
+        node.bgcolor = node._origBgcolor;
+        node.color = node._origColor;
+      } else {
+        node.bgcolor = DIM_BG;
+        node.color = DIM_TITLE;
+      }
+    }
+    const selNode = nodesById[selectedId];
+    const linkIds = {};
+    if (selNode) {
+      for (const inp of (selNode.inputs || [])) {
+        if (inp && inp.link != null) linkIds[inp.link] = true;
+      }
+      for (const out of (selNode.outputs || [])) {
+        for (const lid of (out.links || [])) linkIds[lid] = true;
+      }
+    }
+    lgcanvas.highlighted_links = linkIds;
+    lgcanvas.setDirty(true, true);
+  }
+
+  // Selection → sidebar + highlight
   lgcanvas.onNodeSelected = function(n) {
-    if (n && n.cmData) renderSidebar(n.cmData);
+    if (n && n.cmData) {
+      renderSidebar(n.cmData);
+      applyHighlight(n.cmData.id);
+    }
   };
   lgcanvas.onNodeDeselected = function() {
     document.getElementById("sidebar-content").innerHTML =
       '<div class="empty">Click a node to inspect</div>';
+    applyHighlight(null);
   };
 
   // ---------------- View / filter / fit hooks ----------------
@@ -394,18 +468,34 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   };
 
   // ---------------- Sidebar ----------------
+  function _connHtml(x) {
+    const f = fileById[x.id];
+    if (!f) return "";
+    return `<div class="conn" data-id="${escapeHtml(x.id)}">` +
+      `<span class="rule">${escapeHtml(f.name)}</span>` +
+      `<span class="etype">${escapeHtml(x.type || "import")}</span><br>` +
+      `<span class="desc">${escapeHtml(f.path || "")}</span></div>`;
+  }
+
   function renderSidebar(nd) {
     const el = document.getElementById("sidebar-content");
     if (!nd) { el.innerHTML = '<div class="empty">Click a node to inspect</div>'; return; }
     const findings = findingsByFile[nd.path] || [];
+    const adj = adjacency[nd.id] || { imports: [], importedBy: [] };
     const lines = [
       `<h2>${escapeHtml(nd.name)}</h2>`,
       `<div class="meta-row"><b>Type:</b> ${escapeHtml(nd.type || "file")}</div>`,
       `<div class="meta-row"><b>Path:</b> ${escapeHtml(nd.path || "")}</div>`,
       `<div class="meta-row"><b>Complexity:</b> ${nd.complexity || 0}</div>`,
       `<div class="meta-row"><b>Lines:</b> ${nd.line_start || 1}–${nd.line_end || ""}</div>`,
-      `<h2 style="margin-top:14px;">Findings (${findings.length})</h2>`,
+      `<h2 style="margin-top:14px;">Imports (${adj.imports.length})</h2>`,
     ];
+    if (!adj.imports.length) lines.push('<div class="empty">No outgoing edges</div>');
+    for (const x of adj.imports) lines.push(_connHtml(x));
+    lines.push(`<h2 style="margin-top:14px;">Imported by (${adj.importedBy.length})</h2>`);
+    if (!adj.importedBy.length) lines.push('<div class="empty">Top-level / unused</div>');
+    for (const x of adj.importedBy) lines.push(_connHtml(x));
+    lines.push(`<h2 style="margin-top:14px;">Findings (${findings.length})</h2>`);
     if (findings.length === 0) lines.push('<div class="empty">No lint findings</div>');
     for (const f of findings) {
       const sev = String(f.severity || "low").toLowerCase();
@@ -418,6 +508,18 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       );
     }
     el.innerHTML = lines.join("");
+    // Wire connection-row clicks → jump to that node
+    for (const cel of el.querySelectorAll(".conn")) {
+      cel.addEventListener("click", function() {
+        const id = cel.getAttribute("data-id");
+        const tn = nodesById[id]; if (!tn) return;
+        if (lgcanvas.deselectAllNodes) lgcanvas.deselectAllNodes();
+        if (lgcanvas.selectNode) lgcanvas.selectNode(tn, false);
+        if (lgcanvas.centerOnNode) lgcanvas.centerOnNode(tn);
+        renderSidebar(tn.cmData);
+        applyHighlight(tn.cmData.id);
+      });
+    }
   }
 
   function escapeHtml(s) {
