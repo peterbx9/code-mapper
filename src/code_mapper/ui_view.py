@@ -400,6 +400,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     if (typeof lgcanvas.draw === "function") lgcanvas.draw(true, true);
   }
 
+  // Auto-collapse threshold: any block with more files than this starts
+  // hidden so the canvas isn't dominated by mega-buckets like
+  // "Utilities / Standalone (381)". User can show them individually.
+  const AUTO_HIDE_THRESHOLD = 30;
+
   const blockUiRows = [];  // [{bi, row, tog, box}]
   for (const box of blockBoxes) {
     if (box.bi >= blocksMeta.length) continue;
@@ -432,7 +437,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     blocksList.appendChild(row);
     blockUiRows.push({ bi: box.bi, row, tog, box });
+
+    // Auto-collapse oversized blocks on initial load
+    if (box.bucket.length > AUTO_HIDE_THRESHOLD) {
+      setBlockHidden(box.bi, true, row, tog, box);
+    }
   }
+  // After auto-collapse, refit so the visible blocks fill the canvas
+  setTimeout(fitView, 50);
 
   // Initial fit
   function fitView() {
