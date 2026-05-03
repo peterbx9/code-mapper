@@ -109,7 +109,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                   display: flex; flex-direction: column; }
   #blocks-panel.collapsed { max-height: 36px; overflow: hidden; }
   #blocks-panel header { all: unset; display: flex; align-items: center;
-                         gap: 8px; margin-bottom: 6px; flex-shrink: 0; }
+                         gap: 8px; margin-bottom: 6px; flex-shrink: 0;
+                         cursor: move; user-select: none; }
   #blocks-panel h3 { margin: 0; font-size: 12px; color: #4ec9b0;
                      font-weight: 600; flex: 1;
                      text-transform: uppercase; letter-spacing: 0.5px; }
@@ -539,6 +540,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
   }
   buildBlocksPanel();
+
+  // Make the Logic Blocks panel draggable by its header
+  (function makeDraggable() {
+    const panel = document.getElementById("blocks-panel");
+    const handle = panel.querySelector("header");
+    let dragging = false, ox = 0, oy = 0;
+    handle.addEventListener("mousedown", function(e) {
+      // Don't start drag when clicking a button inside the header
+      if (e.target.tagName === "BUTTON") return;
+      dragging = true;
+      const r = panel.getBoundingClientRect();
+      ox = e.clientX - r.left;
+      oy = e.clientY - r.top;
+      panel.style.right = "auto";  // detach from initial right anchor
+      e.preventDefault();
+    });
+    window.addEventListener("mousemove", function(e) {
+      if (!dragging) return;
+      const x = Math.max(0, Math.min(window.innerWidth - 80, e.clientX - ox));
+      const y = Math.max(44, Math.min(window.innerHeight - 40, e.clientY - oy));
+      panel.style.left = x + "px";
+      panel.style.top = y + "px";
+    });
+    window.addEventListener("mouseup", function() { dragging = false; });
+  })();
 
   // ---------------- Initial build (summary mode) ----------------
   function fitView() {
