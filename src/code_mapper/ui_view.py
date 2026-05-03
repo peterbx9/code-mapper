@@ -16,16 +16,20 @@ from pathlib import Path
 from .schema import NodeType, RepoMap
 
 
-# Distinct colors for logic-block group regions (cycled)
+# Distinct colors for logic-block group regions (cycled).
+# Punchier alpha + saturated borders so clusters read at zoom-out.
 CLUSTER_COLORS = [
-    "rgba(78,201,176,0.08)",   # teal
-    "rgba(220,220,170,0.08)",  # yellow
-    "rgba(244,135,113,0.08)",  # red
-    "rgba(156,220,254,0.08)",  # blue
-    "rgba(197,134,192,0.08)",  # purple
-    "rgba(115,201,144,0.08)",  # green
-    "rgba(206,145,120,0.08)",  # orange
+    "rgba(78,201,176,0.22)",   # teal
+    "rgba(220,220,170,0.22)",  # yellow
+    "rgba(244,135,113,0.22)",  # coral
+    "rgba(156,220,254,0.22)",  # sky
+    "rgba(197,134,192,0.22)",  # purple
+    "rgba(115,201,144,0.22)",  # green
+    "rgba(255,170,90,0.22)",   # orange
+    "rgba(255,123,180,0.22)",  # pink
+    "rgba(120,160,255,0.22)",  # indigo
 ]
+TEST_CLUSTER_COLOR = "rgba(180,180,180,0.18)"
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -99,13 +103,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                                   fill: #ccc; }
   .react-flow__minimap { background: #1a1a1a; }
   /* Cluster group node */
-  .cm-cluster { width: 100%; height: 100%; border-radius: 6px;
-                border: 1px dashed rgba(255,255,255,0.18);
+  .cm-cluster { width: 100%; height: 100%; border-radius: 8px;
+                border: 2px solid rgba(255,255,255,0.32);
+                box-shadow: inset 0 0 24px rgba(0,0,0,0.35);
                 pointer-events: none; position: relative; }
-  .cm-cluster .label { position: absolute; top: 4px; left: 8px;
-                        font-size: 12px; color: #aaa; font-weight: 600;
+  .cm-cluster .label { position: absolute; top: 6px; left: 12px;
+                        font-size: 18px; color: #fff; font-weight: 700;
                         font-family: -apple-system, Segoe UI, sans-serif;
-                        letter-spacing: 0.5px; text-transform: uppercase; }
+                        letter-spacing: 1.2px; text-transform: uppercase;
+                        text-shadow: 0 1px 4px rgba(0,0,0,0.85);
+                        background: rgba(0,0,0,0.45); padding: 2px 8px;
+                        border-radius: 3px; }
   /* Inline finding list (when expanded) */
   .cm-node .findings-inline { margin-top: 6px; max-width: 280px; }
   .cm-node .findings-inline .f { padding: 2px 0; font-size: 10px; color: #aaa; }
@@ -279,12 +287,15 @@ function computeClusterBBoxes(nodes, blocks) {
       if (x + w > maxX) maxX = x + w;
       if (y + h > maxY) maxY = y + h;
     }
-    const PAD = 24;
+    const PAD = 28;
+    const color = blk.is_tests
+      ? (data.test_cluster_color || "rgba(180,180,180,0.18)")
+      : data.cluster_colors[i % data.cluster_colors.length];
     out.push({
       id: `cluster-${i}`, type: "cluster",
-      data: { label: blk.name || `Block ${i}`, color: data.cluster_colors[i % data.cluster_colors.length] },
-      position: { x: minX - PAD, y: minY - PAD - 18 },
-      style: { width: maxX - minX + PAD * 2, height: maxY - minY + PAD * 2 + 18,
+      data: { label: blk.name || `Block ${i}`, color: color },
+      position: { x: minX - PAD, y: minY - PAD - 26 },
+      style: { width: maxX - minX + PAD * 2, height: maxY - minY + PAD * 2 + 26,
                 pointerEvents: "none", zIndex: -1 },
       selectable: false, draggable: false,
     });
@@ -348,7 +359,8 @@ function App() {
   return React.createElement(ReactFlow, {
     nodes, edges, nodeTypes: { cm: CMNode, cluster: CMCluster },
     onNodesChange, onEdgesChange, onNodeClick,
-    fitView: true, minZoom: 0.05, maxZoom: 4,
+    fitView: true, fitViewOptions: { padding: 0.12, includeHiddenNodes: false },
+    minZoom: 0.03, maxZoom: 4,
     style: { background: "#1a1a1a" },
   },
     React.createElement(Background, { color: "#333", gap: 20, size: 1 }),
@@ -419,11 +431,35 @@ def render_ui(repo_map: RepoMap, project_path: str = "") -> str:
         for e in repo_map.edges
         if e.source in valid_ids and e.target in valid_ids
     ]
-    # Logic blocks → cluster regions
+    # Synthetic "Tests" cluster — any file matching test_*.py / *_test.py /
+    # /tests/ / /__tests__/ / *.test.* / *.spec.*. Built first so we can
+    # exclude these IDs from logic-block clusters (one home per node).
+    def _is_test_file(n: dict) -> bool:
+        path = (n.get("path") or "").replace("\\", "/").lower()
+        name = (n.get("name") or "").lower()
+        if "/tests/" in path or "/__tests__/" in path or "/test/" in path:
+            return True
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return True
+        if ".test." in name or ".spec." in name:
+            return True
+        return False
+
+    test_ids = [n["id"] for n in nodes_data if _is_test_file(n)]
+    test_id_set = set(test_ids)
+
+    # Logic blocks → cluster regions (skip files already in tests cluster)
     logic_blocks = []
+    if test_ids:
+        logic_blocks.append({
+            "name": "Tests",
+            "node_ids": test_ids,
+            "is_tests": True,
+        })
     for blk in (repo_map.logic_blocks or []):
         # Filter node_ids to only files (nodes_data is files-only)
-        block_files = [nid for nid in (blk.node_ids or []) if nid in valid_ids]
+        block_files = [nid for nid in (blk.node_ids or [])
+                       if nid in valid_ids and nid not in test_id_set]
         if len(block_files) < 2:
             continue
         logic_blocks.append({
@@ -442,6 +478,7 @@ def render_ui(repo_map: RepoMap, project_path: str = "") -> str:
         "nodes": nodes_data, "edges": edges_data, "findings": findings,
         "logic_blocks": logic_blocks,
         "cluster_colors": CLUSTER_COLORS,
+        "test_cluster_color": TEST_CLUSTER_COLOR,
     })
     return (HTML_TEMPLATE
             .replace("__PROJECT__", html.escape(project_path or "(unknown)"))
