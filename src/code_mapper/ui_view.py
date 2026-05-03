@@ -228,8 +228,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   // ---------------- Custom node class ----------------
   function CMFileNode() {
-    this.addInput("in", "*");
-    this.addOutput("out", "*");
+    // Edges represent imports. Source of an edge = importer.
+    //   - Left  socket: incoming edges = files that import THIS file
+    //   - Right socket: outgoing edges = files THIS file imports
+    this.addInput("used by", "*");
+    this.addOutput("uses", "*");
     this.size = [220, 60];
     this.cmData = null;  // populated after instantiation
   }
@@ -344,8 +347,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   // ONE node per logic block. Big card, colored title bar = block color,
   // body shows file count + complexity total + finding totals.
   function CMBlockNode() {
-    this.addOutput("→", "*");
-    this.addInput("←", "*");
+    // Same semantics as file nodes — left = used by, right = uses.
+    this.addInput("used by", "*");
+    this.addOutput("uses", "*");
     this.size = [260, 110];
     this.cmBlock = null;
   }
