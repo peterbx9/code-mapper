@@ -357,6 +357,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   };
   LiteGraph.registerNodeType("cm/block", CMBlockNode);
 
+  // Per-node title text color override. LiteGraph reads
+  // NODE_TITLE_TEXT_COLOR globally, so we swap it during the draw of
+  // any node that sets `_titleTextColor`. File nodes keep the default
+  // white-on-dark; block-summary nodes use black-on-bright.
+  const _origDrawNodeShape = LGraphCanvas.prototype.drawNodeShape;
+  LGraphCanvas.prototype.drawNodeShape = function(node, ctx, ...rest) {
+    const orig = LiteGraph.NODE_TITLE_TEXT_COLOR;
+    if (node && node._titleTextColor) {
+      LiteGraph.NODE_TITLE_TEXT_COLOR = node._titleTextColor;
+    }
+    try { return _origDrawNodeShape.call(this, node, ctx, ...rest); }
+    finally { LiteGraph.NODE_TITLE_TEXT_COLOR = orig; }
+  };
+
   // ---------------- Build adjacency + blocksMeta enrichment ----------------
   const adjacency = {};
   const fileById = {};
@@ -435,6 +449,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
       node.color = b.color;     // title bar
       node.bgcolor = "#1f1f1f"; // body
+      node._titleTextColor = "#000";  // black title on bright bar
       node.cmBlock = b;
       graph.add(node);
       blockNodesById[b.bi] = node;
