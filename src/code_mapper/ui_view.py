@@ -198,6 +198,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   LiteGraph.NODE_TITLE_COLOR = "#000";
   LiteGraph.NODE_TITLE_TEXT_COLOR = "#000";
   LiteGraph.NODE_SELECTED_TITLE_COLOR = "#000";
+  LiteGraph.NODE_TITLE_TEXT_FONT = "11px -apple-system, Segoe UI, sans-serif";
+  LiteGraph.NODE_TEXT_SIZE = 11;
+  LiteGraph.NODE_TITLE_HEIGHT = 22;
 
   // Brighter file-node title-bar palette so black title text stays
   // readable in detail view too. (Original palette was too dark.)
