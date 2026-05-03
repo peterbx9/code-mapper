@@ -201,6 +201,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   LiteGraph.NODE_TITLE_TEXT_FONT = "11px -apple-system, Segoe UI, sans-serif";
   LiteGraph.NODE_TEXT_SIZE = 11;
   LiteGraph.NODE_TITLE_HEIGHT = 22;
+  // Vertical baseline of the title text inside the bar. Default is
+  // tuned for a 30px bar; with a 22px bar we move the baseline up so
+  // the text sits in the vertical middle.
+  LiteGraph.NODE_TITLE_TEXT_Y = 15;
 
   // Brighter file-node title-bar palette so black title text stays
   // readable in detail view too. (Original palette was too dark.)
