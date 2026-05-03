@@ -13,7 +13,7 @@ import html
 import json
 from pathlib import Path
 
-from .schema import EdgeType, NodeType, RepoMap
+from .schema import NodeType, RepoMap
 
 
 # Distinct colors for logic-block group regions (cycled)
