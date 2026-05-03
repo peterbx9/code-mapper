@@ -102,6 +102,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                border: 1px solid #f48771; color: #f48771;
                font-family: monospace; font-size: 12px; z-index: 100;
                border-radius: 4px; }
+  #blocks-panel { position: fixed; top: 56px; left: 12px; width: 240px;
+                  max-height: calc(100vh - 80px);
+                  background: rgba(30,30,30,0.96); border: 1px solid #333;
+                  border-radius: 4px; padding: 10px 12px; z-index: 5;
+                  display: flex; flex-direction: column; }
+  #blocks-panel.collapsed { max-height: 36px; overflow: hidden; }
+  #blocks-panel header { all: unset; display: flex; align-items: center;
+                         gap: 8px; margin-bottom: 6px; flex-shrink: 0; }
+  #blocks-panel h3 { margin: 0; font-size: 12px; color: #4ec9b0;
+                     font-weight: 600; flex: 1;
+                     text-transform: uppercase; letter-spacing: 0.5px; }
+  #blocks-panel .panel-btn { background: #2a2a2a; color: #ccc;
+                              border: 1px solid #444; padding: 2px 6px;
+                              font-size: 10px; cursor: pointer;
+                              border-radius: 2px; }
+  #blocks-panel .panel-btn:hover { background: #353535; }
+  #blocks-list { overflow-y: auto; flex: 1; }
+  .block-row { display: flex; align-items: center; gap: 6px;
+               padding: 4px 6px; cursor: pointer; border-radius: 3px;
+               font-size: 11px; color: #ccc; }
+  .block-row:hover { background: #2a2a2a; }
+  .block-row .swatch { width: 10px; height: 10px; border-radius: 2px;
+                       flex-shrink: 0; }
+  .block-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis;
+                     white-space: nowrap; }
+  .block-row .toggle { padding: 2px 6px; background: #333; color: #ccc;
+                       border-radius: 2px; font-size: 10px;
+                       flex-shrink: 0; min-width: 32px; text-align: center; }
+  .block-row.hidden .name { color: #555; }
+  .block-row.hidden .toggle { background: #1a1a1a; color: #666; }
 </style>
 </head><body>
 <header>
@@ -120,6 +150,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </header>
 <div id="root">
   <canvas id="graph-canvas"></canvas>
+</div>
+<div id="blocks-panel">
+  <header>
+    <h3>Logic Blocks</h3>
+    <button class="panel-btn" onclick="window.cm.allBlocks(true)">Hide all</button>
+    <button class="panel-btn" onclick="window.cm.allBlocks(false)">Show all</button>
+    <button class="panel-btn"
+            onclick="document.getElementById('blocks-panel').classList.toggle('collapsed')">−</button>
+  </header>
+  <div id="blocks-list"></div>
 </div>
 <div id="error-box"></div>
 <div id="sidebar">
@@ -331,6 +371,61 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     node._origColor = node.color;
   }
 
+  // ---------------- Per-block hide/show panel ----------------
+  // For each layout block (skip the unassigned bucket), build a row with
+  // a swatch, name, file count, and a hide/show toggle. Toggling sets
+  // node.flags.collapsed on every member node so the contents fold into
+  // the title bar — leaving the colored group region visible.
+  const blocksList = document.getElementById("blocks-list");
+  const blockState = {};  // box.bi → hidden bool
+
+  function setBlockHidden(bi, hidden, row, tog, box) {
+    blockState[bi] = hidden;
+    for (const memberData of box.bucket) {
+      const node = nodesById[memberData.id];
+      if (!node) continue;
+      node.flags = node.flags || {};
+      node.flags.collapsed = !!hidden;
+    }
+    if (row) row.classList.toggle("hidden", !!hidden);
+    if (tog) tog.textContent = hidden ? "show" : "hide";
+    lgcanvas.setDirty(true, true);
+  }
+
+  const blockUiRows = [];  // [{bi, row, tog, box}]
+  for (const box of blockBoxes) {
+    if (box.bi >= blocksMeta.length) continue;
+    const blk = blocksMeta[box.bi];
+    const color = blk.is_tests
+      ? (data.test_cluster_color || "#888888")
+      : (data.cluster_colors[box.bi % data.cluster_colors.length] || "#4ec9b0");
+
+    const row = document.createElement("div");
+    row.className = "block-row";
+
+    const swatch = document.createElement("span");
+    swatch.className = "swatch";
+    swatch.style.background = color;
+    row.appendChild(swatch);
+
+    const name = document.createElement("span");
+    name.className = "name";
+    name.textContent = (blk.name || `Block ${box.bi}`) + ` (${box.bucket.length})`;
+    row.appendChild(name);
+
+    const tog = document.createElement("span");
+    tog.className = "toggle";
+    tog.textContent = "hide";
+    row.appendChild(tog);
+
+    row.addEventListener("click", () => {
+      setBlockHidden(box.bi, !blockState[box.bi], row, tog, box);
+    });
+
+    blocksList.appendChild(row);
+    blockUiRows.push({ bi: box.bi, row, tog, box });
+  }
+
   // Initial fit
   function fitView() {
     if (!graph._nodes.length) return;
@@ -462,8 +557,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           node.flags.collapsed = hide;
         }
       }
+      // Sync the blocks panel UI to match
+      for (const r of blockUiRows) {
+        blockState[r.bi] = hide;
+        r.row.classList.toggle("hidden", hide);
+        r.tog.textContent = hide ? "show" : "hide";
+      }
       lgcanvas.setDirty(true, true);
       fitView();
+    },
+    allBlocks: function(hide) {
+      for (const r of blockUiRows) {
+        setBlockHidden(r.bi, hide, r.row, r.tog, r.box);
+      }
     },
   };
 
