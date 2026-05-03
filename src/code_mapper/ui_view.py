@@ -190,6 +190,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     return;
   }
 
+  // Title text color — black for summary block bars (bright cluster
+  // colors). buildDetailGraph swaps to white for file nodes (dark
+  // type-colored title bars where black would be unreadable).
+  LiteGraph.NODE_TITLE_TEXT_COLOR = "#000";
+  LiteGraph.NODE_SELECTED_TITLE_COLOR = "#000";
+
+  // Brighter file-node title-bar palette so black title text stays
+  // readable in detail view too. (Original palette was too dark.)
+  const NODE_TYPE_BG_BRIGHT = {
+    file: "#7ab8e0",
+    "class": "#c89cd6",
+    "function": "#d6c97a",
+    module: "#7ab8e0",
+  };
+
   // ---------------- Constants from Python side ----------------
   const NODE_TYPE_COLORS = __NODE_TYPE_COLORS__;
 
@@ -328,15 +343,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   CMBlockNode.prototype.onDrawForeground = function(ctx) {
     if (!this.cmBlock) return;
     const b = this.cmBlock;
-    // Draw our own title in black on top of the (now-blank) title bar.
-    // y is negative because the title bar sits above the body origin.
-    const titleH = LiteGraph.NODE_TITLE_HEIGHT || 30;
-    ctx.save();
-    ctx.fillStyle = "#000";
-    ctx.font = "bold 14px -apple-system, Segoe UI, sans-serif";
-    ctx.textBaseline = "middle";
-    ctx.fillText(String(b.displayTitle || ""), 12, -titleH / 2);
-    ctx.restore();
     ctx.fillStyle = "#fff";
     ctx.font = "bold 13px -apple-system, Segoe UI, sans-serif";
     ctx.fillText(b.fileCount + " files", 12, 36);
@@ -459,11 +465,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     visibleBlocks.forEach((b, k) => {
       const node = LiteGraph.createNode("cm/block");
       if (!node) return;
-      // Blank LiteGraph's own title text — we draw our own in
-      // onDrawForeground in pure black. Stash the display string on
-      // cmBlock so onDrawForeground can read it.
-      b.displayTitle = b.name + " (" + b.fileCount + ")";
-      node.title = "";
+      node.title = b.name + " (" + b.fileCount + ")";
       node.pos = [(k % cols) * W, Math.floor(k / cols) * H];
       node.color = b.color;     // title bar
       node.bgcolor = "#1f1f1f"; // body
@@ -518,7 +520,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       node.title = n.name || "(unnamed)";
       const pos = positions[n.id] || { x: 0, y: 0 };
       node.pos = [pos.x, pos.y];
-      node.color = NODE_TYPE_COLORS[n.type] || "#3b6c8e";
+      node.color = NODE_TYPE_BG_BRIGHT[n.type] || NODE_TYPE_COLORS[n.type] || "#7ab8e0";
       node.bgcolor = "#2a2a2a";
       node._origBgcolor = node.bgcolor;
       node._origColor = node.color;
